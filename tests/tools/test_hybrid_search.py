@@ -114,9 +114,14 @@ class TestVecDistanceThreshold:
         with patch("tools.hybrid_search._vec_serialize", return_value=b"\x00" * 4096):
             results = search._vector_search("test", limit=50)
 
-        assert len(results) == 1
-        assert results[0]["message_id"] == 1
-        assert results[0]["vector_distance"] == 0.8
+        assert len(results) == 2
+
+        search._lazy_index_unindexed = MagicMock()
+        search._bm25_search = MagicMock(return_value=[])
+        with patch("tools.hybrid_search._vec_serialize", return_value=b"\x00" * 4096):
+            fused = search.search("test", limit=10)
+        assert len(fused) == 1
+        assert fused[0]["message_id"] == 1
 
 
 class TestRRFScoreThreshold:

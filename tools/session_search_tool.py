@@ -496,12 +496,50 @@ def session_search(
                 _search_error = parsed.get("error", "unknown")
         except (json.JSONDecodeError, TypeError):
             pass
+
+        parts = [f"session_search query={query!r} engine={_search_engine} count={_search_result_count}"]
         if _search_error:
-            logging.info("session_search query=%r engine=%s count=%d error=%s elapsed=%.2fs",
-                         query, _search_engine, _search_result_count, _search_error, elapsed)
-        else:
-            logging.info("session_search query=%r engine=%s count=%d elapsed=%.2fs",
-                         query, _search_engine, _search_result_count, elapsed)
+            parts.append(f"error={_search_error}")
+
+        try:
+            diag = parsed.get("diagnostics", {})
+            if diag:
+                bm25_hits = diag.get("bm25_hits")
+                vec_hits = diag.get("vector_hits")
+                vec_before = diag.get("vec_before_threshold")
+                vec_thresh = diag.get("vec_distance_threshold")
+                fused_before = diag.get("fused_before_rrf_threshold")
+                fused_after = diag.get("fused_after_rrf_threshold")
+                rrf_thresh = diag.get("rrf_score_threshold")
+                if bm25_hits is not None:
+                    parts.append(f"bm25={bm25_hits}")
+                if vec_before is not None:
+                    parts.append(f"vec_raw={vec_before}")
+                if vec_hits is not None:
+                    parts.append(f"vec_filtered={vec_hits}")
+                if vec_thresh is not None:
+                    parts.append(f"vec_thresh={vec_thresh}")
+                if fused_before is not None:
+                    parts.append(f"fused_before={fused_before}")
+                if fused_after is not None:
+                    parts.append(f"fused_after={fused_after}")
+                if rrf_thresh is not None and rrf_thresh > 0:
+                    parts.append(f"rrf_thresh={rrf_thresh}")
+        except Exception:
+            pass
+
+        results_list = parsed.get("results", [])
+        if results_list and isinstance(results_list, list):
+            summary_snippets = []
+            for r in results_list[:3]:
+                s = r.get("summary", "")
+                if s:
+                    summary_snippets.append(s[:80].replace("\n", " "))
+            if summary_snippets:
+                parts.append(f"summaries={summary_snippets}")
+
+        parts.append(f"elapsed={elapsed:.2f}s")
+        logging.info(" ".join(parts))
         return result_str
 
     if db is None:
@@ -568,6 +606,7 @@ def session_search(
                 "results": [],
                 "count": 0,
                 "message": "No matching sessions found.",
+                "diagnostics": {"bm25_hits": 0},
             }, ensure_ascii=False))
 
         # Resolve child sessions to their parent — delegation stores detailed
@@ -708,6 +747,7 @@ def session_search(
             "results": summaries,
             "count": len(summaries),
             "sessions_searched": len(seen_sessions),
+            "diagnostics": {"bm25_hits": len(raw_results), "sessions_after_dedup": len(seen_sessions)},
         }, ensure_ascii=False))
 
     except Exception as e:
