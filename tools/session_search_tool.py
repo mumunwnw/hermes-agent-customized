@@ -285,19 +285,7 @@ def _try_hybrid_search(
         hybrid_results = hybrid.search(query, limit=limit * 3)
         
         if not hybrid_results:
-            return json.dumps({
-                "success": True,
-                "query": query,
-                "engine": "hybrid",
-                "results": [],
-                "count": 0,
-                "message": "No matching sessions found (hybrid).",
-                "diagnostics": {
-                    "engine": "hybrid",
-                    "vec_available": hybrid.vec_available,
-                    "has_api_key": bool(hybrid.api_key),
-                },
-            }, ensure_ascii=False)
+            return None
         
         # Convert hybrid results to session IDs for summarization
         session_ids = []
@@ -515,7 +503,14 @@ def session_search(
         hybrid_result = _try_hybrid_search(query, limit, db, current_session_id, session_search_config)
         if hybrid_result is not None:
             return hybrid_result
-        return tool_error("Hybrid search is configured but unavailable.", success=False)
+        return json.dumps({
+            "success": True,
+            "query": query,
+            "engine": "hybrid",
+            "results": [],
+            "count": 0,
+            "message": "No matching sessions found (hybrid).",
+        }, ensure_ascii=False)
     elif engine == "auto":
         hybrid_result = _try_hybrid_search(query, limit, db, current_session_id, session_search_config)
         if hybrid_result is not None:
@@ -700,10 +695,17 @@ def session_search(
 
 
 def check_session_search_requirements() -> bool:
-    """Requires SQLite state database and an auxiliary text model."""
     try:
         from hermes_state import DEFAULT_DB_PATH
         return DEFAULT_DB_PATH.parent.exists()
+    except ImportError:
+        return False
+
+
+def check_hybrid_search_requirements() -> bool:
+    try:
+        from tools.hybrid_search import check_hybrid_search_requirements as _check
+        return _check()
     except ImportError:
         return False
 
