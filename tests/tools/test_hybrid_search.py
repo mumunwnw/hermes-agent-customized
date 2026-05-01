@@ -200,6 +200,11 @@ class TestConfigReading:
         assert search.vec_top_k == 50
         assert search.vec_distance_threshold == 1.2
         assert search.rrf_score_threshold == 0.0
+        assert search.index_roles == ["user", "assistant"]
+
+    def test_custom_index_roles(self):
+        search = _make_search(config={"hybrid": {"index_roles": ["user", "assistant", "tool"]}})
+        assert search.index_roles == ["user", "assistant", "tool"]
 
     def test_api_key_fallback_to_env(self):
         with patch.dict("os.environ", {"SILICONFLOW_API_KEY": "sk-env"}):
@@ -251,3 +256,59 @@ class TestSearchEmpty:
         search = _make_search()
         assert search.search("") == []
         assert search.search("   ") == []
+
+
+class TestRoleFilterSQL:
+    def test_default_roles(self):
+        search = _make_search()
+        clause, params = search._role_filter_sql()
+        assert "role IN" in clause
+        assert params == ["user", "assistant"]
+
+    def test_custom_roles(self):
+        search = _make_search(config={"hybrid": {"index_roles": ["user"]}})
+        clause, params = search._role_filter_sql()
+        assert params == ["user"]
+
+    def test_table_alias(self):
+        search = _make_search()
+        clause, params = search._role_filter_sql("msg")
+        assert "msg.role IN" in clause
+
+
+class TestRebuildIndex:
+    def test_rebuild_not_available(self):
+        search = _make_search()
+        search.vec_available = False
+        result = search.rebuild_index()
+        assert "error" in result
+
+    def test_rebuild_no_api_key(self):
+        search = _make_search()
+        search.vec_available = True
+        search.api_key = ""
+        result = search.rebuild_index()
+        assert "error" in result
+
+    def test_rebuild_drops_and_reindexes(self):
+        search = _make_search(config={"hybrid": {"embed_api_key": "sk-test"}})
+        search.vec_available = True
+        search.api_key = "sk-test"
+        search._ensure_vec_loaded = MagicMock(return_value=True)
+        search._load_vec_extension = MagicMock(return_value=True)
+
+        call_log = []
+        def mock_execute(sql, *args):
+            result = MagicMock()
+            call_log.append(sql.strip().upper())
+            if "DROP" in sql.upper():
+                pass
+            elif "SELECT" in sql.upper() and "MESSAGES" in sql.upper() and "COUNT" not in sql.upper():
+                result.fetchall.return_value = []
+            return result
+        search.db._conn.execute = mock_execute
+        search.db._conn.commit = MagicMock()
+
+        result = search.rebuild_index()
+        assert result["rebuilt"] is True
+        assert any("DROP" in c for c in call_log)

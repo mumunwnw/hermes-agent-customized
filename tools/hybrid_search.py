@@ -251,6 +251,7 @@ class HybridSessionSearch:
         self.vec_top_k = hybrid_config.get("vec_top_k", 50)
         self.vec_distance_threshold = hybrid_config.get("vec_distance_threshold", 1.2)
         self.rrf_score_threshold = hybrid_config.get("rrf_score_threshold", 0.0)
+        self.index_roles = hybrid_config.get("index_roles", ["user", "assistant"])
         
         # 检查 sqlite-vec 可用性并加载扩展
         self.vec_available = self._load_vec_extension()
@@ -260,6 +261,12 @@ class HybridSessionSearch:
         # 初始化索引器
         self.indexer = EmbeddingIndexer(
             db, self.embedding_api_url, self.embedding_model, self.api_key
+        )
+
+    def _role_filter_sql(self, table_alias: str = "m") -> tuple:
+        return (
+            f"AND {table_alias}.role IN ({','.join('?' for _ in self.index_roles)}) ",
+            list(self.index_roles),
         )
     
     def _load_vec_extension(self) -> bool:
@@ -574,11 +581,11 @@ class HybridSessionSearch:
         self.indexer.enqueue(message_id, content, session_id)
     
     def _lazy_index_unindexed(self, max_messages: int = 500):
-        """搜索前懒索引：查找未索引的消息并异步入队。"""
         if not self.vec_available or not self.api_key:
             return
         
         self._ensure_vec_loaded()
+        role_clause, role_params = self._role_filter_sql()
         
         try:
             vec_exists = self.db._conn.execute(
@@ -587,19 +594,21 @@ class HybridSessionSearch:
             
             if not vec_exists:
                 unindexed = self.db._conn.execute(
-                    """SELECT m.id, m.content, m.session_id FROM messages m
+                    f"""SELECT m.id, m.content, m.session_id FROM messages m
                        WHERE m.content IS NOT NULL AND LENGTH(m.content) >= 50
+                       {role_clause}
                        ORDER BY m.timestamp DESC LIMIT ?""",
-                    (max_messages,)
+                    role_params + [max_messages]
                 ).fetchall()
             else:
                 unindexed = self.db._conn.execute(
-                    """SELECT m.id, m.content, m.session_id FROM messages m
+                    f"""SELECT m.id, m.content, m.session_id FROM messages m
                        LEFT JOIN message_vec v ON m.id = v.message_id
                        WHERE v.message_id IS NULL
                          AND m.content IS NOT NULL AND LENGTH(m.content) >= 50
+                         {role_clause}
                        ORDER BY m.timestamp DESC LIMIT ?""",
-                    (max_messages,)
+                    role_params + [max_messages]
                 ).fetchall()
             
             if not unindexed:
@@ -617,9 +626,10 @@ class HybridSessionSearch:
             logger.warning("Lazy indexing failed: %s", e, exc_info=True)
     
     def index_session(self, session_id: str):
-        """批量索引指定 session 的所有未索引消息（用于 on_session_finalize）。"""
         if not self.vec_available or not self.api_key:
             return
+        
+        role_clause, role_params = self._role_filter_sql()
         
         try:
             vec_exists = self.db._conn.execute(
@@ -628,19 +638,21 @@ class HybridSessionSearch:
             
             if not vec_exists:
                 unindexed = self.db._conn.execute(
-                    """SELECT m.id, m.content, m.session_id FROM messages m
+                    f"""SELECT m.id, m.content, m.session_id FROM messages m
                        WHERE m.session_id = ?
-                         AND m.content IS NOT NULL AND LENGTH(m.content) >= 50""",
-                    (session_id,)
+                         AND m.content IS NOT NULL AND LENGTH(m.content) >= 50
+                         {role_clause}""",
+                    [session_id] + role_params
                 ).fetchall()
             else:
                 unindexed = self.db._conn.execute(
-                    """SELECT m.id, m.content, m.session_id FROM messages m
+                    f"""SELECT m.id, m.content, m.session_id FROM messages m
                        LEFT JOIN message_vec v ON m.id = v.message_id
                        WHERE m.session_id = ?
                          AND v.message_id IS NULL
-                         AND m.content IS NOT NULL AND LENGTH(m.content) >= 50""",
-                    (session_id,)
+                         AND m.content IS NOT NULL AND LENGTH(m.content) >= 50
+                         {role_clause}""",
+                    [session_id] + role_params
                 ).fetchall()
             
             if not unindexed:
@@ -657,10 +669,11 @@ class HybridSessionSearch:
             logger.warning("Session indexing failed for %s: %s", session_id, e, exc_info=True)
     
     def index_status(self) -> Dict[str, Any]:
-        """返回索引状态统计。"""
         try:
+            role_clause, role_params = self._role_filter_sql("")
             total = self.db._conn.execute(
-                "SELECT COUNT(*) as cnt FROM messages WHERE content IS NOT NULL AND LENGTH(content) >= 50"
+                f"SELECT COUNT(*) as cnt FROM messages WHERE content IS NOT NULL AND LENGTH(content) >= 50 {role_clause}",
+                role_params
             ).fetchone()["cnt"]
             
             vec_exists = self.db._conn.execute(
@@ -683,8 +696,51 @@ class HybridSessionSearch:
                 "indexed_count": self.indexer.indexed_count,
                 "failed_count": self.indexer.failed_count,
                 "vec_available": self.vec_available,
+                "index_roles": self.index_roles,
             }
         except Exception as e:
+            return {"error": str(e)}
+
+    def rebuild_index(self) -> Dict[str, Any]:
+        if not self.vec_available or not self.api_key:
+            return {"error": "hybrid search not available (sqlite-vec or API key missing)"}
+        
+        self._ensure_vec_loaded()
+        role_clause, role_params = self._role_filter_sql()
+        
+        try:
+            self.db._conn.execute("DROP TABLE IF EXISTS message_vec")
+            self.db._conn.commit()
+            logger.info("Dropped message_vec table for rebuild")
+            
+            self._load_vec_extension()
+            
+            unindexed = self.db._conn.execute(
+                f"""SELECT m.id, m.content, m.session_id FROM messages m
+                   WHERE m.content IS NOT NULL AND LENGTH(m.content) >= 50
+                   {role_clause}
+                   ORDER BY m.timestamp DESC""",
+                role_params
+            ).fetchall()
+            
+            if not unindexed:
+                return {"rebuilt": True, "indexed": 0, "message": "No messages to index"}
+            
+            for row in unindexed:
+                self.indexer.enqueue(row["id"], row["content"], row["session_id"])
+            
+            logger.info("Rebuilding hybrid index: %d messages", len(unindexed))
+            self.indexer.wait_for_completion(timeout=600)
+            
+            return {
+                "rebuilt": True,
+                "total_messages": len(unindexed),
+                "indexed": self.indexer.indexed_count,
+                "failed": self.indexer.failed_count,
+                "index_roles": self.index_roles,
+            }
+        except Exception as e:
+            logger.error("Rebuild index failed: %s", e, exc_info=True)
             return {"error": str(e)}
 
 
