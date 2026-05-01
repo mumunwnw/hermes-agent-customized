@@ -305,7 +305,16 @@ Phase 3: 测试与稳定 ✅
   ├─ BM25 输出也标注 engine ✅
   └─ E2E 测试（含 LLM 摘要） ✅
 
-Phase 4: 优化 ⏭️
+Phase 4: Bug 修复与日志 ✅
+  ├─ Bug 1: check_hybrid_search_requirements 模块级引用 → wrapper 函数 ✅
+  ├─ Bug 2: pysqlite3 row_factory → pysqlite.Row ✅
+  ├─ Bug 3-5: tuple 当 dict 访问 → _row_get() helper ✅
+  ├─ Bug 6: _bm25_search 依赖 row_factory → Bug 2 间接修复 ✅
+  ├─ Bug 7: hybrid 空结果不 fallback BM25 → auto 模式检查 count > 0 ✅
+  ├─ Bug 8: _db_path vs db_path → getattr 双重查找 ✅
+  └─ session_search 调用日志记录 → _log_and_return() 包装所有返回路径 ✅
+
+Phase 5: 优化 ⏭️
   ├─ 智能消息过滤
   ├─ 查询向量缓存
   └─ 孤立向量清理

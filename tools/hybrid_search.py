@@ -117,7 +117,7 @@ class EmbeddingIndexer:
             if not embedding:
                 return
             
-            db_path = getattr(self.db, '_db_path', None)
+            db_path = getattr(self.db, 'db_path', None) or getattr(self.db, '_db_path', None)
             if not db_path:
                 try:
                     row = self.db._conn.execute("PRAGMA database_list").fetchone()
