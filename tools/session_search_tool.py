@@ -285,7 +285,19 @@ def _try_hybrid_search(
         hybrid_results = hybrid.search(query, limit=limit * 3)
         
         if not hybrid_results:
-            return None
+            return json.dumps({
+                "success": True,
+                "query": query,
+                "engine": "hybrid",
+                "results": [],
+                "count": 0,
+                "message": "No matching sessions found (hybrid).",
+                "diagnostics": {
+                    "engine": "hybrid",
+                    "vec_available": hybrid.vec_available,
+                    "has_api_key": bool(hybrid.api_key),
+                },
+            }, ensure_ascii=False)
         
         # Convert hybrid results to session IDs for summarization
         session_ids = []
@@ -479,12 +491,39 @@ def session_search(
             limit = int(limit)
         except (TypeError, ValueError):
             limit = 3
-    limit = max(1, min(limit, 5))  # Clamp to [1, 5]
+    limit = max(1, min(limit, 5))
 
-    # Recent sessions mode: when query is empty, return metadata for recent sessions.
-    # No LLM calls — just DB queries for titles, previews, timestamps.
+    import time as _time
+    _search_start = _time.monotonic()
+    _search_engine = "bm25"
+    _search_result_count = 0
+    _search_error = None
+
+    def _log_and_return(result_str: str) -> str:
+        nonlocal _search_engine, _search_result_count, _search_error
+        elapsed = _time.monotonic() - _search_start
+        try:
+            parsed = json.loads(result_str) if isinstance(result_str, str) and result_str.startswith("{") else {}
+            _search_engine = parsed.get("engine", _search_engine)
+            _search_result_count = parsed.get("count", 0)
+            if not parsed.get("success", True):
+                _search_error = parsed.get("error", "unknown")
+        except (json.JSONDecodeError, TypeError):
+            pass
+        if _search_error:
+            logging.info("session_search query=%r engine=%s count=%d error=%s elapsed=%.2fs",
+                         query, _search_engine, _search_result_count, _search_error, elapsed)
+        else:
+            logging.info("session_search query=%r engine=%s count=%d elapsed=%.2fs",
+                         query, _search_engine, _search_result_count, elapsed)
+        return result_str
+
+    if db is None:
+        logging.warning("session_search called but db is None")
+        return _log_and_return(tool_error("Session database not available.", success=False))
+
     if not query or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id)
+        return _log_and_return(_list_recent_sessions(db, limit, current_session_id))
 
     query = query.strip()
 
@@ -502,19 +541,22 @@ def session_search(
     if engine == "hybrid":
         hybrid_result = _try_hybrid_search(query, limit, db, current_session_id, session_search_config)
         if hybrid_result is not None:
-            return hybrid_result
-        return json.dumps({
-            "success": True,
+            return _log_and_return(hybrid_result)
+        return _log_and_return(json.dumps({
+            "success": False,
             "query": query,
             "engine": "hybrid",
-            "results": [],
-            "count": 0,
-            "message": "No matching sessions found (hybrid).",
-        }, ensure_ascii=False)
+            "error": "Hybrid search is configured but unavailable.",
+        }, ensure_ascii=False))
     elif engine == "auto":
         hybrid_result = _try_hybrid_search(query, limit, db, current_session_id, session_search_config)
         if hybrid_result is not None:
-            return hybrid_result
+            try:
+                parsed = json.loads(hybrid_result)
+                if parsed.get("count", 0) > 0:
+                    return _log_and_return(hybrid_result)
+            except (json.JSONDecodeError, TypeError):
+                return _log_and_return(hybrid_result)
     
     # BM25 search (default or fallback)
     try:
@@ -533,14 +575,14 @@ def session_search(
         )
 
         if not raw_results:
-            return json.dumps({
+            return _log_and_return(json.dumps({
                 "success": True,
                 "query": query,
                 "engine": "bm25",
                 "results": [],
                 "count": 0,
                 "message": "No matching sessions found.",
-            }, ensure_ascii=False)
+            }, ensure_ascii=False))
 
         # Resolve child sessions to their parent — delegation stores detailed
         # content in child sessions, but the user's conversation is the parent.
@@ -642,10 +684,10 @@ def session_search(
                 "Session summarization timed out after 60 seconds",
                 exc_info=True,
             )
-            return json.dumps({
+            return _log_and_return(json.dumps({
                 "success": False,
                 "error": "Session summarization timed out. Try a more specific query or reduce the limit.",
-            }, ensure_ascii=False)
+            }, ensure_ascii=False))
 
         summaries = []
         for (session_id, match_info, conversation_text, session_meta), result in zip(tasks, results):
@@ -680,18 +722,18 @@ def session_search(
 
             summaries.append(entry)
 
-        return json.dumps({
+        return _log_and_return(json.dumps({
             "success": True,
             "query": query,
             "engine": "bm25",
             "results": summaries,
             "count": len(summaries),
             "sessions_searched": len(seen_sessions),
-        }, ensure_ascii=False)
+        }, ensure_ascii=False))
 
     except Exception as e:
         logging.error("Session search failed: %s", e, exc_info=True)
-        return tool_error(f"Search failed: {str(e)}", success=False)
+        return _log_and_return(tool_error(f"Search failed: {str(e)}", success=False))
 
 
 def check_session_search_requirements() -> bool:
