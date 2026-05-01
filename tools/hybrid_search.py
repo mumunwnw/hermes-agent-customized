@@ -25,6 +25,22 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def _row_get(row, key, default=None):
+    try:
+        return row[key]
+    except (TypeError, KeyError, IndexError):
+        if isinstance(row, (tuple, list)):
+            col_map = {
+                "id": 0, "message_id": 0, "session_id": 1,
+                "content": 2, "role": 3, "timestamp": 4,
+                "distance": 5, "file": 2, "name": 0, "cnt": 0,
+            }
+            idx = col_map.get(key)
+            if idx is not None and idx < len(row):
+                return row[idx]
+        return default
+
+
 def _vec_serialize(vector: List[float]) -> bytes:
     """Serialize float vector for sqlite-vec. Handles API name differences."""
     import sqlite_vec
@@ -330,7 +346,7 @@ class HybridSessionSearch:
                 new_conn.enable_load_extension(True)
                 sqlite_vec.load(new_conn)
                 new_conn.enable_load_extension(False)
-                new_conn.row_factory = conn.row_factory
+                new_conn.row_factory = pysqlite.Row
                 
                 self.db._conn = new_conn
                 logger.debug("sqlite-vec loaded via pysqlite3 connection swap")
@@ -451,16 +467,17 @@ class HybridSessionSearch:
             
             formatted = []
             for r in results:
-                distance = r["distance"]
-                if distance > self.vec_distance_threshold:
+                distance = _row_get(r, "distance")
+                if distance is None or distance > self.vec_distance_threshold:
                     continue
+                content = _row_get(r, "content") or ""
                 formatted.append({
-                    "message_id": r["id"],
-                    "session_id": r["session_id"],
-                    "content": r["content"] or "",
-                    "role": r["role"],
-                    "timestamp": r["timestamp"],
-                    "snippet": (r["content"] or "")[:200] + "...",
+                    "message_id": _row_get(r, "id"),
+                    "session_id": _row_get(r, "session_id"),
+                    "content": content,
+                    "role": _row_get(r, "role"),
+                    "timestamp": _row_get(r, "timestamp"),
+                    "snippet": content[:200] + "...",
                     "vector_distance": distance,
                 })
             
@@ -616,7 +633,7 @@ class HybridSessionSearch:
             
             count = 0
             for row in unindexed:
-                self.indexer.enqueue(row["id"], row["content"], row["session_id"])
+                self.indexer.enqueue(_row_get(row, "id"), _row_get(row, "content"), _row_get(row, "session_id"))
                 count += 1
             
             if count > 0:
@@ -660,7 +677,7 @@ class HybridSessionSearch:
             
             count = 0
             for row in unindexed:
-                self.indexer.enqueue(row["id"], row["content"], row["session_id"])
+                self.indexer.enqueue(_row_get(row, "id"), _row_get(row, "content"), _row_get(row, "session_id"))
                 count += 1
             
             if count > 0:
@@ -727,7 +744,7 @@ class HybridSessionSearch:
                 return {"rebuilt": True, "indexed": 0, "message": "No messages to index"}
             
             for row in unindexed:
-                self.indexer.enqueue(row["id"], row["content"], row["session_id"])
+                self.indexer.enqueue(_row_get(row, "id"), _row_get(row, "content"), _row_get(row, "session_id"))
             
             logger.info("Rebuilding hybrid index: %d messages", len(unindexed))
             self.indexer.wait_for_completion(timeout=600)
