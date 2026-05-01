@@ -265,6 +265,135 @@ async def _summarize_session(
 _HIDDEN_SESSION_SOURCES = ("tool",)
 
 
+def _try_hybrid_search(
+    query: str,
+    limit: int,
+    db,
+    current_session_id: str = None,
+    session_search_config: dict = None,
+) -> Optional[str]:
+    """Try to search using hybrid engine. Returns None if hybrid is unavailable."""
+    try:
+        from tools.hybrid_search import HybridSessionSearch, check_hybrid_search_requirements
+        
+        if not check_hybrid_search_requirements():
+            return None
+        
+        hybrid = HybridSessionSearch(db, config=session_search_config)
+        
+        # Execute hybrid search
+        hybrid_results = hybrid.search(query, limit=limit * 3)
+        
+        if not hybrid_results:
+            return json.dumps({
+                "success": True,
+                "query": query,
+                "engine": "hybrid",
+                "results": [],
+                "count": 0,
+                "message": "No matching sessions found (hybrid).",
+            }, ensure_ascii=False)
+        
+        # Convert hybrid results to session IDs for summarization
+        session_ids = []
+        for result in hybrid_results:
+            sid = result.get("session_id", "")
+            if sid and sid != current_session_id:
+                session_ids.append((sid, result.get("rrf_score", 0.0), result))
+        
+        # Deduplicate and limit
+        seen = set()
+        unique_sessions = []
+        for sid, score, hybrid_meta in session_ids:
+            if sid not in seen:
+                seen.add(sid)
+                unique_sessions.append((sid, hybrid_meta))
+            if len(unique_sessions) >= limit:
+                break
+        
+        # Summarize sessions
+        return _summarize_hybrid_sessions(unique_sessions, query, db)
+        
+    except Exception as e:
+        logging.warning("Hybrid search failed: %s", e, exc_info=True)
+        return None
+
+
+def _summarize_hybrid_sessions(
+    unique_sessions: List[tuple],
+    query: str,
+    db,
+) -> str:
+    """Summarize sessions found by hybrid search."""
+    tasks = []
+    for session_id, hybrid_meta in unique_sessions:
+        try:
+            messages = db.get_messages_as_conversation(session_id)
+            if not messages:
+                continue
+            session_meta = db.get_session(session_id) or {}
+            conversation_text = _format_conversation(messages)
+            conversation_text = _truncate_around_matches(conversation_text, query)
+            tasks.append((session_id, hybrid_meta, conversation_text, session_meta))
+        except Exception as e:
+            logging.warning("Failed to prepare session %s: %s", session_id, e, exc_info=True)
+    
+    async def _summarize_all() -> List[Union[str, Exception]]:
+        max_concurrency = _get_session_search_max_concurrency()
+        semaphore = asyncio.Semaphore(max_concurrency)
+        
+        async def _bounded_summary(text: str, meta: Dict[str, Any]) -> Optional[str]:
+            async with semaphore:
+                return await _summarize_session(text, query, meta)
+        
+        coros = [
+            _bounded_summary(text, meta)
+            for _, _, text, meta in tasks
+        ]
+        return await asyncio.gather(*coros, return_exceptions=True)
+    
+    try:
+        from model_tools import _run_async
+        results = _run_async(_summarize_all())
+    except concurrent.futures.TimeoutError:
+        logging.warning("Session summarization timed out after 60 seconds", exc_info=True)
+        return json.dumps({
+            "success": False,
+            "error": "Session summarization timed out.",
+        }, ensure_ascii=False)
+    
+    summaries = []
+    for (session_id, match_info, conversation_text, _), result in zip(tasks, results):
+        if isinstance(result, Exception):
+            logging.warning("Failed to summarize session %s: %s", session_id, result, exc_info=True)
+            result = None
+        
+        entry = {
+            "session_id": session_id,
+            "when": _format_timestamp(match_info.get("session_started")),
+            "source": match_info.get("source", "unknown"),
+            "model": match_info.get("model"),
+            "hybrid_score": match_info.get("rrf_score", 0.0),
+        }
+        
+        if result:
+            entry["summary"] = result
+        else:
+            preview = (conversation_text[:500] + "\n…[truncated]") if conversation_text else "No preview available."
+            entry["summary"] = f"[Raw preview]\n{preview}"
+        
+        summaries.append(entry)
+    
+    return json.dumps({
+        "success": True,
+        "query": query,
+        "engine": "hybrid",
+        "results": summaries,
+        "count": len(summaries),
+        "sessions_searched": len(unique_sessions),
+    }, ensure_ascii=False)
+
+
 def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
     """Return metadata for the most recent sessions (no LLM calls)."""
     try:
@@ -357,6 +486,28 @@ def session_search(
 
     query = query.strip()
 
+    # Determine which search engine to use
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        session_search_config = config.get("auxiliary", {}).get("session_search", {}) if isinstance(config, dict) else {}
+        engine = session_search_config.get("engine", "bm25")
+    except Exception as e:
+        logging.debug("Failed to load session_search config: %s", e)
+        engine = "bm25"
+
+    # Route to appropriate search engine
+    if engine == "hybrid":
+        hybrid_result = _try_hybrid_search(query, limit, db, current_session_id, session_search_config)
+        if hybrid_result is not None:
+            return hybrid_result
+        return tool_error("Hybrid search is configured but unavailable.", success=False)
+    elif engine == "auto":
+        hybrid_result = _try_hybrid_search(query, limit, db, current_session_id, session_search_config)
+        if hybrid_result is not None:
+            return hybrid_result
+    
+    # BM25 search (default or fallback)
     try:
         # Parse role filter
         role_list = None
