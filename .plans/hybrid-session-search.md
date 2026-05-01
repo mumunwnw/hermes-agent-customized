@@ -312,7 +312,9 @@ Phase 4: Bug 修复与日志 ✅
   ├─ Bug 6: _bm25_search 依赖 row_factory → Bug 2 间接修复 ✅
   ├─ Bug 7: hybrid 空结果不 fallback BM25 → auto 模式检查 count > 0 ✅
   ├─ Bug 8: _db_path vs db_path → getattr 双重查找 ✅
-  └─ session_search 调用日志记录 → _log_and_return() 包装所有返回路径 ✅
+  ├─ rebuild_hybrid_index/hybrid_index_status db=None → 加入 _AGENT_LOOP_TOOLS ✅
+  ├─ session_search 调用日志记录 → _log_and_return() 包装所有返回路径 ✅
+  └─ 增强日志：bm25/vec命中数、threshold过滤前后、LLM摘要片段 ✅
 
 Phase 5: 优化 ⏭️
   ├─ 智能消息过滤

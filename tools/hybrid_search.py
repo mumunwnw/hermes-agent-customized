@@ -468,7 +468,7 @@ class HybridSessionSearch:
             formatted = []
             for r in results:
                 distance = _row_get(r, "distance")
-                if distance is None or distance > self.vec_distance_threshold:
+                if distance is None:
                     continue
                 content = _row_get(r, "content") or ""
                 formatted.append({
@@ -528,9 +528,14 @@ class HybridSessionSearch:
         self._lazy_index_unindexed()
         
         bm25_results = self._bm25_search(query, limit=50)
-        vector_results = self._vector_search(query, limit=50)
+        vector_results_raw = self._vector_search(query, limit=50)
+        vec_before_threshold = len(vector_results_raw)
+        
+        vector_results = [r for r in vector_results_raw
+                          if r.get("vector_distance") is not None and r["vector_distance"] <= self.vec_distance_threshold]
         
         fused_results = self._rrf_fusion(bm25_results, vector_results, limit=limit * 2)
+        fused_before_threshold = len(fused_results)
         
         if self.rrf_score_threshold > 0 and fused_results:
             fused_results = [r for r in fused_results if r.get("rrf_score", 0) >= self.rrf_score_threshold]
@@ -542,6 +547,11 @@ class HybridSessionSearch:
             r["_diagnostics"] = {
                 "bm25_hits": len(bm25_results),
                 "vector_hits": len(vector_results),
+                "vec_before_threshold": vec_before_threshold,
+                "vec_distance_threshold": self.vec_distance_threshold,
+                "fused_before_rrf_threshold": fused_before_threshold,
+                "fused_after_rrf_threshold": len(fused_results),
+                "rrf_score_threshold": self.rrf_score_threshold,
                 "vec_available": self.vec_available,
                 "has_api_key": bool(self.api_key),
             }
