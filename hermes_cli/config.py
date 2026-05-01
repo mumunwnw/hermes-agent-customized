@@ -772,6 +772,7 @@ DEFAULT_CONFIG = {
                 "vec_distance_threshold": 1.2,
                 "rrf_score_threshold": 0.0,
                 "index_roles": ["user", "assistant"],
+                "min_content_length": None,
                 "auto_index": True,
             },
         },

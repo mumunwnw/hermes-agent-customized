@@ -60,11 +60,12 @@ def _check_sqlite_vec_available() -> bool:
 class EmbeddingIndexer:
     """异步 embedding 索引器 - 队列 + 单消费者模式。"""
     
-    def __init__(self, db, api_url: str, model: str, api_key: str):
+    def __init__(self, db, api_url: str, model: str, api_key: str, min_content_length: int = None):
         self.db = db
         self.api_url = api_url
         self.model = model
         self.api_key = api_key
+        self.min_content_length = min_content_length
         
         # 队列（最多 1000 条）
         self.queue = queue.Queue(maxsize=1000)
@@ -99,8 +100,7 @@ class EmbeddingIndexer:
     
     def enqueue(self, message_id: int, content: str, session_id: str):
         """将消息加入索引队列。"""
-        # 过滤太短的消息
-        if len(content) < 50:
+        if self.min_content_length is not None and self.min_content_length > 0 and len(content) < self.min_content_length:
             return
         
         try:
@@ -268,6 +268,8 @@ class HybridSessionSearch:
         self.vec_distance_threshold = hybrid_config.get("vec_distance_threshold", 1.2)
         self.rrf_score_threshold = hybrid_config.get("rrf_score_threshold", 0.0)
         self.index_roles = hybrid_config.get("index_roles", ["user", "assistant"])
+        _raw_min = hybrid_config.get("min_content_length")
+        self.min_content_length = int(_raw_min) if _raw_min is not None else None
         
         # 检查 sqlite-vec 可用性并加载扩展
         self.vec_available = self._load_vec_extension()
@@ -276,7 +278,8 @@ class HybridSessionSearch:
         
         # 初始化索引器
         self.indexer = EmbeddingIndexer(
-            db, self.embedding_api_url, self.embedding_model, self.api_key
+            db, self.embedding_api_url, self.embedding_model, self.api_key,
+            min_content_length=self.min_content_length,
         )
 
     def _role_filter_sql(self, table_alias: str = "m") -> tuple:
@@ -284,6 +287,11 @@ class HybridSessionSearch:
             f"AND {table_alias}.role IN ({','.join('?' for _ in self.index_roles)}) ",
             list(self.index_roles),
         )
+
+    def _min_length_sql(self, table_alias: str = "m") -> str:
+        if self.min_content_length is not None and self.min_content_length > 0:
+            return f"AND LENGTH({table_alias}.content) >= {self.min_content_length} "
+        return ""
     
     def _load_vec_extension(self) -> bool:
         """尝试加载 sqlite-vec 扩展到数据库连接。"""
@@ -619,10 +627,12 @@ class HybridSessionSearch:
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='message_vec'"
             ).fetchone()
             
+            min_len_clause = self._min_length_sql()
+            
             if not vec_exists:
                 unindexed = self.db._conn.execute(
                     f"""SELECT m.id, m.content, m.session_id FROM messages m
-                       WHERE m.content IS NOT NULL AND LENGTH(m.content) >= 50
+                       WHERE m.content IS NOT NULL {min_len_clause}
                        {role_clause}
                        ORDER BY m.timestamp DESC LIMIT ?""",
                     role_params + [max_messages]
@@ -632,8 +642,8 @@ class HybridSessionSearch:
                     f"""SELECT m.id, m.content, m.session_id FROM messages m
                        LEFT JOIN message_vec v ON m.id = v.message_id
                        WHERE v.message_id IS NULL
-                         AND m.content IS NOT NULL AND LENGTH(m.content) >= 50
-                         {role_clause}
+                         AND m.content IS NOT NULL {min_len_clause}
+                       {role_clause}
                        ORDER BY m.timestamp DESC LIMIT ?""",
                     role_params + [max_messages]
                 ).fetchall()
@@ -667,8 +677,8 @@ class HybridSessionSearch:
                 unindexed = self.db._conn.execute(
                     f"""SELECT m.id, m.content, m.session_id FROM messages m
                        WHERE m.session_id = ?
-                         AND m.content IS NOT NULL AND LENGTH(m.content) >= 50
-                         {role_clause}""",
+                         AND m.content IS NOT NULL {self._min_length_sql()}
+                       {role_clause}""",
                     [session_id] + role_params
                 ).fetchall()
             else:
@@ -677,8 +687,8 @@ class HybridSessionSearch:
                        LEFT JOIN message_vec v ON m.id = v.message_id
                        WHERE m.session_id = ?
                          AND v.message_id IS NULL
-                         AND m.content IS NOT NULL AND LENGTH(m.content) >= 50
-                         {role_clause}""",
+                         AND m.content IS NOT NULL {self._min_length_sql()}
+                       {role_clause}""",
                     [session_id] + role_params
                 ).fetchall()
             
@@ -699,7 +709,7 @@ class HybridSessionSearch:
         try:
             role_clause, role_params = self._role_filter_sql("")
             total = self.db._conn.execute(
-                f"SELECT COUNT(*) as cnt FROM messages WHERE content IS NOT NULL AND LENGTH(content) >= 50 {role_clause}",
+                f"SELECT COUNT(*) as cnt FROM messages WHERE content IS NOT NULL {self._min_length_sql('')} {role_clause}",
                 role_params
             ).fetchone()["cnt"]
             
@@ -724,6 +734,7 @@ class HybridSessionSearch:
                 "failed_count": self.indexer.failed_count,
                 "vec_available": self.vec_available,
                 "index_roles": self.index_roles,
+                "min_content_length": self.min_content_length,
             }
         except Exception as e:
             return {"error": str(e)}
@@ -744,7 +755,7 @@ class HybridSessionSearch:
             
             unindexed = self.db._conn.execute(
                 f"""SELECT m.id, m.content, m.session_id FROM messages m
-                   WHERE m.content IS NOT NULL AND LENGTH(m.content) >= 50
+                   WHERE m.content IS NOT NULL {self._min_length_sql()}
                    {role_clause}
                    ORDER BY m.timestamp DESC""",
                 role_params

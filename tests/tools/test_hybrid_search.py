@@ -317,3 +317,57 @@ class TestRebuildIndex:
         result = search.rebuild_index()
         assert result["rebuilt"] is True
         assert any("DROP" in c for c in call_log)
+
+
+class TestMinContentLength:
+    def test_default_is_none(self):
+        search = _make_search()
+        assert search.min_content_length is None
+
+    def test_custom_value(self):
+        search = _make_search(config={"hybrid": {"min_content_length": 30}})
+        assert search.min_content_length == 30
+
+    def test_null_means_no_filter(self):
+        search = _make_search()
+        assert search._min_length_sql() == ""
+
+    def test_zero_means_no_filter(self):
+        search = _make_search(config={"hybrid": {"min_content_length": 0}})
+        assert search.min_content_length == 0
+        assert search._min_length_sql() == ""
+
+    def test_positive_value_generates_clause(self):
+        search = _make_search(config={"hybrid": {"min_content_length": 100}})
+        clause = search._min_length_sql()
+        assert "LENGTH(m.content) >= 100" in clause
+
+    def test_enqueue_respects_min_length_none(self):
+        from tools.hybrid_search import EmbeddingIndexer
+        indexer = EmbeddingIndexer(MagicMock(), "http://x", "model", "key", min_content_length=None)
+        assert indexer.queue.qsize() == 0
+        indexer.enqueue(1, "hi", "s1")
+        assert indexer.queue.qsize() == 1
+
+    def test_enqueue_respects_min_length_set(self):
+        from tools.hybrid_search import EmbeddingIndexer
+        indexer = EmbeddingIndexer(MagicMock(), "http://x", "model", "key", min_content_length=50)
+        indexer.enqueue(1, "hi", "s1")
+        assert indexer.queue.qsize() == 0
+        indexer.enqueue(2, "a" * 50, "s1")
+        assert indexer.queue.qsize() == 1
+
+    def test_index_status_includes_min_content_length(self):
+        search = _make_search(config={"hybrid": {"min_content_length": 30}})
+        def mock_execute(sql, *args):
+            result = MagicMock()
+            if "sqlite_master" in sql:
+                result.fetchone.return_value = None
+            elif "COUNT" in sql:
+                result.fetchone.return_value = OrderedDict([("cnt", 10)])
+            else:
+                result.fetchone.return_value = None
+            return result
+        search.db._conn.execute = mock_execute
+        status = search.index_status()
+        assert status["min_content_length"] == 30
