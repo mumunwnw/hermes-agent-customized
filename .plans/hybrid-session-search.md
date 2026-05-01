@@ -175,6 +175,36 @@ CREATE VIRTUAL TABLE IF NOT EXISTS message_vec USING vec0(
 );
 ```
 
+## 注册工具
+
+| 工具名 | 功能 | 参数 | check_fn |
+|--------|------|------|----------|
+| `session_search` | 搜索历史会话 | query, role_filter, limit | 始终可用 |
+| `rebuild_hybrid_index` | 重建向量索引（DROP+重建+全量索引） | 无 | check_hybrid_search_requirements |
+| `hybrid_index_status` | 查看索引状态和诊断信息 | 无 | 始终可用 |
+
+### session_search 输出格式
+
+```json
+{
+  "success": true,
+  "query": "部署问题",
+  "engine": "hybrid",
+  "results": [...],
+  "count": 3,
+  "diagnostics": {
+    "bm25_hits": 5,
+    "vector_hits": 3,
+    "vec_available": true,
+    "has_api_key": true
+  }
+}
+```
+
+- `engine`: `"bm25"` 或 `"hybrid"`，明确告知使用了哪个引擎
+- `diagnostics`: 仅 hybrid 模式返回，包含各路搜索命中数和可用性信息
+- `diagnostics.vector_hits == 0` 表示向量搜索未贡献结果
+
 ## 启用步骤
 
 1. 安装依赖：`pip install sqlite-vec pysqlite3-binary`
@@ -270,6 +300,9 @@ Phase 3: 测试与稳定 ✅
   ├─ rrf_score_threshold 两层阈值设计 ✅
   ├─ index_roles 过滤（默认排除 tool 消息） ✅
   ├─ rebuild_hybrid_index 工具 ✅
+  ├─ hybrid_index_status 工具 ✅
+  ├─ search 输出 diagnostics 诊断信息 ✅
+  ├─ BM25 输出也标注 engine ✅
   └─ E2E 测试（含 LLM 摘要） ✅
 
 Phase 4: 优化 ⏭️
