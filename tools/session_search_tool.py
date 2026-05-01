@@ -740,3 +740,43 @@ registry.register(
     check_fn=check_session_search_requirements,
     emoji="🔍",
 )
+
+
+REBUILD_HYBRID_INDEX_SCHEMA = {
+    "name": "rebuild_hybrid_index",
+    "description": (
+        "Rebuild the hybrid search vector index from scratch. "
+        "Use this when search results seem stale or after changing index_roles config. "
+        "This drops and recreates the vector index table, then re-indexes all eligible messages. "
+        "May take several minutes for large databases."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+
+def rebuild_hybrid_index(db=None) -> str:
+    from tools.hybrid_search import HybridSessionSearch, check_hybrid_search_requirements
+    if not check_hybrid_search_requirements():
+        return json.dumps({"error": "Hybrid search not available (sqlite-vec or API key missing)"}, ensure_ascii=False)
+    try:
+        from hermes_cli.config import load_config
+        config = load_config().get("auxiliary", {}).get("session_search", {})
+    except Exception:
+        config = {}
+    hybrid = HybridSessionSearch(db, config=config)
+    result = hybrid.rebuild_index()
+    return json.dumps(result, ensure_ascii=False)
+
+
+registry.register(
+    name="rebuild_hybrid_index",
+    toolset="session_search",
+    schema=REBUILD_HYBRID_INDEX_SCHEMA,
+    handler=lambda args, **kw: rebuild_hybrid_index(db=kw.get("db")),
+    check_fn=check_hybrid_search_requirements,
+    emoji="🔄",
+)
