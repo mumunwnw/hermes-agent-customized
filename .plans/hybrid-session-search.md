@@ -154,8 +154,8 @@ auxiliary:
 hermes-agent-customized/
 ├── hermes_cli/config.py                        # DEFAULT_CONFIG: auxiliary.session_search
 ├── tools/
-│   ├── session_search_tool.py                  # 路由: engine → bm25/hybrid/auto + rebuild_hybrid_index 工具
-│   └── hybrid_search.py                        # 核心: BM25+Vector+RRF+Reranker+Rebuild
+│   ├── session_search_tool.py                  # 路由 + 3个工具: session_search, rebuild_hybrid_index, hybrid_index_status
+│   └── hybrid_search.py                        # 核心: BM25+Vector+RRF+Reranker+Rebuild+Diagnostics
 ├── plugins/
 │   └── hybrid-search-indexer/                  # 插件: on_session_finalize 钩子
 │       ├── plugin.yaml
