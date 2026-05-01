@@ -154,8 +154,8 @@ auxiliary:
 hermes-agent-customized/
 ├── hermes_cli/config.py                        # DEFAULT_CONFIG: auxiliary.session_search
 ├── tools/
-│   ├── session_search_tool.py                  # 路由: engine → bm25/hybrid/auto
-│   └── hybrid_search.py                        # 核心: BM25+Vector+RRF+Reranker
+│   ├── session_search_tool.py                  # 路由: engine → bm25/hybrid/auto + rebuild_hybrid_index 工具
+│   └── hybrid_search.py                        # 核心: BM25+Vector+RRF+Reranker+Rebuild
 ├── plugins/
 │   └── hybrid-search-indexer/                  # 插件: on_session_finalize 钩子
 │       ├── plugin.yaml
@@ -267,6 +267,9 @@ Phase 3: 测试与稳定 ✅
   ├─ BM25 vs Hybrid 对比测试 ✅
   ├─ Reranker 评估（不推荐默认开启） ✅
   ├─ vec_top_k + vec_distance_threshold ✅
+  ├─ rrf_score_threshold 两层阈值设计 ✅
+  ├─ index_roles 过滤（默认排除 tool 消息） ✅
+  ├─ rebuild_hybrid_index 工具 ✅
   └─ E2E 测试（含 LLM 摘要） ✅
 
 Phase 4: 优化 ⏭️
