@@ -503,31 +503,31 @@ class HybridSessionSearch:
         return fused
     
     def search(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
-        """混合搜索：BM25 + Vector + RRF + (可选) Reranker。"""
         if not query or not query.strip():
             return []
         
         query = query.strip()
         
-        # 懒索引：搜索前索引未索引的消息
         self._lazy_index_unindexed()
         
-        # Layer 1: BM25 关键词搜索
         bm25_results = self._bm25_search(query, limit=50)
-        
-        # Layer 2: Vector 语义搜索
         vector_results = self._vector_search(query, limit=50)
         
-        # Layer 3: RRF 融合
         fused_results = self._rrf_fusion(bm25_results, vector_results, limit=limit * 2)
         
-        # Layer 3.5: RRF score 阈值过滤
         if self.rrf_score_threshold > 0 and fused_results:
             fused_results = [r for r in fused_results if r.get("rrf_score", 0) >= self.rrf_score_threshold]
         
-        # Layer 4: Reranker（可选）
         if self.use_reranker and fused_results:
             fused_results = self._rerank_results(query, fused_results, limit=limit)
+        
+        for r in fused_results[:limit]:
+            r["_diagnostics"] = {
+                "bm25_hits": len(bm25_results),
+                "vector_hits": len(vector_results),
+                "vec_available": self.vec_available,
+                "has_api_key": bool(self.api_key),
+            }
         
         return fused_results[:limit]
     

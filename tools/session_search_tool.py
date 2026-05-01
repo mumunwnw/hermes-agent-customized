@@ -290,6 +290,11 @@ def _try_hybrid_search(
                 "results": [],
                 "count": 0,
                 "message": "No matching sessions found (hybrid).",
+                "diagnostics": {
+                    "engine": "hybrid",
+                    "vec_available": hybrid.vec_available,
+                    "has_api_key": bool(hybrid.api_key),
+                },
             }, ensure_ascii=False)
         
         # Convert hybrid results to session IDs for summarization
@@ -361,10 +366,16 @@ def _summarize_hybrid_sessions(
         }, ensure_ascii=False)
     
     summaries = []
+    first_diagnostics = None
     for (session_id, match_info, conversation_text, _), result in zip(tasks, results):
         if isinstance(result, Exception):
             logging.warning("Failed to summarize session %s: %s", session_id, result, exc_info=True)
             result = None
+        
+        if first_diagnostics is None and "_diagnostics" in match_info:
+            first_diagnostics = match_info.pop("_diagnostics")
+        elif "_diagnostics" in match_info:
+            del match_info["_diagnostics"]
         
         entry = {
             "session_id": session_id,
@@ -382,14 +393,17 @@ def _summarize_hybrid_sessions(
         
         summaries.append(entry)
     
-    return json.dumps({
+    result = {
         "success": True,
         "query": query,
         "engine": "hybrid",
         "results": summaries,
         "count": len(summaries),
         "sessions_searched": len(unique_sessions),
-    }, ensure_ascii=False)
+    }
+    if first_diagnostics:
+        result["diagnostics"] = first_diagnostics
+    return json.dumps(result, ensure_ascii=False)
 
 
 def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
@@ -519,6 +533,7 @@ def session_search(
             return json.dumps({
                 "success": True,
                 "query": query,
+                "engine": "bm25",
                 "results": [],
                 "count": 0,
                 "message": "No matching sessions found.",
@@ -658,6 +673,7 @@ def session_search(
         return json.dumps({
             "success": True,
             "query": query,
+            "engine": "bm25",
             "results": summaries,
             "count": len(summaries),
             "sessions_searched": len(seen_sessions),
@@ -779,4 +795,50 @@ registry.register(
     handler=lambda args, **kw: rebuild_hybrid_index(db=kw.get("db")),
     check_fn=check_hybrid_search_requirements,
     emoji="🔄",
+)
+
+
+HYBRID_INDEX_STATUS_SCHEMA = {
+    "name": "hybrid_index_status",
+    "description": (
+        "Check the status of the hybrid search vector index. "
+        "Returns indexing progress, total messages, indexed count, and configuration. "
+        "Use this to diagnose why hybrid search might not be returning results, "
+        "or to check if indexing is complete before searching."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+
+def hybrid_index_status(db=None) -> str:
+    from tools.hybrid_search import HybridSessionSearch, check_hybrid_search_requirements
+    available = check_hybrid_search_requirements()
+    if not available:
+        return json.dumps({
+            "available": False,
+            "reason": "sqlite-vec or API key missing",
+        }, ensure_ascii=False)
+    try:
+        from hermes_cli.config import load_config
+        config = load_config().get("auxiliary", {}).get("session_search", {})
+    except Exception:
+        config = {}
+    hybrid = HybridSessionSearch(db, config=config)
+    status = hybrid.index_status()
+    status["available"] = True
+    status["engine_config"] = config.get("engine", "bm25")
+    return json.dumps(status, ensure_ascii=False)
+
+
+registry.register(
+    name="hybrid_index_status",
+    toolset="session_search",
+    schema=HYBRID_INDEX_STATUS_SCHEMA,
+    handler=lambda args, **kw: hybrid_index_status(db=kw.get("db")),
+    check_fn=lambda: True,
+    emoji="📊",
 )
