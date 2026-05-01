@@ -1,0 +1,5 @@
+name: hybrid-search-indexer
+version: 1.0.0
+description: "Index session messages for hybrid search (BM25+Vector) when sessions finalize. Requires session_search.engine set to 'hybrid' or 'auto'."
+hooks:
+  - on_session_finalize
