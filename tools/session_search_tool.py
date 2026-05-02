@@ -272,12 +272,12 @@ def _try_hybrid_search(
 ) -> Optional[str]:
     """Try to search using hybrid engine. Returns None if hybrid is unavailable."""
     try:
-        from tools.hybrid_search import HybridSessionSearch, check_hybrid_search_requirements
+        from tools.hybrid_search import get_hybrid_search, check_hybrid_search_requirements
         
         if not check_hybrid_search_requirements():
             return None
         
-        hybrid = HybridSessionSearch(db, config=session_search_config)
+        hybrid = get_hybrid_search(db, config=session_search_config)
         
         # Execute hybrid search
         hybrid_results = hybrid.search(query, limit=limit * 3)
@@ -853,7 +853,7 @@ REBUILD_HYBRID_INDEX_SCHEMA = {
 
 
 def rebuild_hybrid_index(db=None) -> str:
-    from tools.hybrid_search import HybridSessionSearch, check_hybrid_search_requirements
+    from tools.hybrid_search import get_hybrid_search, check_hybrid_search_requirements
     if not check_hybrid_search_requirements():
         return json.dumps({"error": "Hybrid search not available (sqlite-vec or API key missing)"}, ensure_ascii=False)
     try:
@@ -861,7 +861,7 @@ def rebuild_hybrid_index(db=None) -> str:
         config = load_config().get("auxiliary", {}).get("session_search", {})
     except Exception:
         config = {}
-    hybrid = HybridSessionSearch(db, config=config)
+    hybrid = get_hybrid_search(db, config=config)
     result = hybrid.rebuild_index()
     return json.dumps(result, ensure_ascii=False)
 
@@ -893,7 +893,7 @@ HYBRID_INDEX_STATUS_SCHEMA = {
 
 
 def hybrid_index_status(db=None) -> str:
-    from tools.hybrid_search import HybridSessionSearch, check_hybrid_search_requirements
+    from tools.hybrid_search import get_hybrid_search, check_hybrid_search_requirements
     available = check_hybrid_search_requirements()
     if not available:
         return json.dumps({
@@ -905,7 +905,7 @@ def hybrid_index_status(db=None) -> str:
         config = load_config().get("auxiliary", {}).get("session_search", {})
     except Exception:
         config = {}
-    hybrid = HybridSessionSearch(db, config=config)
+    hybrid = get_hybrid_search(db, config=config)
     status = hybrid.index_status()
     status["available"] = True
     status["engine_config"] = config.get("engine", "bm25")
@@ -939,7 +939,7 @@ INDEX_UNINDEXED_MESSAGES_SCHEMA = {
 
 
 def index_unindexed_messages(db=None) -> str:
-    from tools.hybrid_search import HybridSessionSearch, check_hybrid_search_requirements
+    from tools.hybrid_search import get_hybrid_search, check_hybrid_search_requirements
     available = check_hybrid_search_requirements()
     if not available:
         return json.dumps({
@@ -951,7 +951,7 @@ def index_unindexed_messages(db=None) -> str:
         config = load_config().get("auxiliary", {}).get("session_search", {})
     except Exception:
         config = {}
-    hybrid = HybridSessionSearch(db, config=config)
+    hybrid = get_hybrid_search(db, config=config)
     result = hybrid._index_unindexed_batch()
     result["success"] = True
     return json.dumps(result, ensure_ascii=False)

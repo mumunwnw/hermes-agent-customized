@@ -69,15 +69,13 @@ session_search_tool.py
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  Layer 1: 后台守护线程自动索引（Auto Index Daemon）                │
+│  Layer 1: 空闲索引守护线程（Idle Index Daemon）                    │
 │  触发：HybridSessionSearch 初始化时启动，独立于搜索运行            │
-│  逻辑：每 idle_index_interval 秒检查未索引消息数                   │
-│        未索引 >= auto_index_threshold → _fetch_unindexed          │
+│  逻辑：距最后一条消息超过 idle_index_interval 时触发索引          │
 │        → index_batch（按 token 分组，批量 API + 批量 DB 写入）     │
-│  特性：_indexing_lock 防并发，_stop_event 支持优雅停止             │
+│  特性：每个空闲周期只触发一次，新消息到来后重置                     │
 │  优点：不依赖搜索触发，不遗漏，不阻塞主线程                        │
-│  配置：auto_index=true, auto_index_threshold=10,                  │
-│        idle_index_interval="30s"                                  │
+│        idle_index_interval="15min"                                  │
 └─────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────────┐
 │  Layer 2: 会话结束索引（Session Finalize Indexing）               │
@@ -137,8 +135,7 @@ auxiliary:
       min_content_length: null
       batch_token_limit: 7000
       auto_index: true
-      auto_index_threshold: 10
-      idle_index_interval: "30s"
+      idle_index_interval: "15min"
 ```
 
 ### 配置字段职责
@@ -165,7 +162,6 @@ auxiliary:
 | `hybrid.min_content_length` | `hybrid_search.py` | 最低索引内容长度，null=不限 | - |
 | `hybrid.batch_token_limit` | `hybrid_search.py` | 批量索引 token 预算，每组 API 调用不超过此值 | - |
 | `hybrid.auto_index` | `hybrid_search.py` | 自动索引总开关，false=禁用守护线程 | - |
-| `hybrid.auto_index_threshold` | `hybrid_search.py` | 未索引消息数达到此阈值时触发索引 | - |
 | `hybrid.idle_index_interval` | `hybrid_search.py` | 守护线程空闲检查间隔，支持人类可读格式 | - |
 
 ### 配置填写规范
@@ -179,8 +175,7 @@ auxiliary:
 | `min_content_length` | int/null | `null` | `null` 或正整数 | null=不限，任何长度都索引；设为50则跳过短消息 |
 | `batch_token_limit` | int | `7000` | `1000 ~ 8000` | bge-m3 上限 8192 tokens，7000留安全余量 |
 | `auto_index` | bool | `true` | `true` / `false` | false=禁用守护线程，只能手动触发索引 |
-| `auto_index_threshold` | int | `10` | `1 ~ 1000` | 未索引消息达到此数量时触发批量索引 |
-| `idle_index_interval` | int/float/string | `"30s"` | `"30s"`, `"15min"`, `"2hr"`, `"1h30m"`, `30` | 支持人类可读格式：数字+单位（s/sec/second, m/min/minute, h/hr/hour），可组合如"1h30m"；纯数字视为秒；最小5秒 |
+| `idle_index_interval` | int/float/string | `"15min"` | `"30s"`, `"15min"`, `"2hr"`, `"1h30m"`, `30` | 空闲多久后触发索引；支持人类可读格式；最小5秒；每个空闲周期只触发一次 |
 
 ## 文件清单
 
@@ -387,7 +382,6 @@ Phase 5: 批量索引与智能触发 ✅
   ├─ 批量 400 自动降级逐条调用 ✅
   ├─ min_content_length 可配置（默认 null=不限） ✅
   ├─ 后台守护线程（auto_index_daemon）替代懒加载 ✅
-  ├─ auto_index_threshold 阈值触发 ✅
   ├─ idle_index_interval 轮询间隔（支持人类可读格式） ✅
   ├─ _indexing_lock 防并发 ✅
   ├─ _fetch_unindexed 统一查询（替代3处重复SQL） ✅

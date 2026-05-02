@@ -23,7 +23,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from hermes_state import SessionDB
-from tools.hybrid_search import HybridSessionSearch, check_hybrid_search_requirements
+from tools.hybrid_search import get_hybrid_search, check_hybrid_search_requirements
 from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -53,7 +53,7 @@ def cmd_index(args):
         sys.exit(1)
     
     db = SessionDB(db_path)
-    hybrid = HybridSessionSearch(db)
+    hybrid = get_hybrid_search(db)
     
     print("🔍 Indexing all unindexed messages...")
     

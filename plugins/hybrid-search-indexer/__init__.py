@@ -18,13 +18,13 @@ def _on_session_finalize(session_id: str = None, platform: str = "", **_: Any) -
     except Exception:
         return
     try:
-        from tools.hybrid_search import HybridSessionSearch
+        from tools.hybrid_search import get_hybrid_search
         from hermes_state import SessionDB
         from hermes_constants import get_hermes_home
 
         db_path = get_hermes_home() / "state.db"
         db = SessionDB(db_path)
-        search = HybridSessionSearch(db, config=ss_config)
+        search = get_hybrid_search(db, config=ss_config)
         search.index_session()
     except Exception as exc:
         logger.warning("hybrid-search-indexer: failed: %s", exc)

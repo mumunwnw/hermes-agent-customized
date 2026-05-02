@@ -23,6 +23,9 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+_hybrid_instance = None
+_hybrid_lock = threading.Lock()
+
 
 def _row_get(row, key, default=None):
     try:
@@ -403,14 +406,14 @@ class HybridSessionSearch:
         self.vec_distance_threshold = hybrid_config.get("vec_distance_threshold", 1.2)
         self.rrf_score_threshold = hybrid_config.get("rrf_score_threshold", 0.0)
         self.index_roles = hybrid_config.get("index_roles", ["user", "assistant"])
-        _raw_min = hybrid_config.get("min_content_length")
-        self.min_content_length = int(_raw_min) if _raw_min is not None else None
+        _raw_min = hybrid_config.get("min_content_length", 0)
+        self.min_content_length = int(_raw_min) if _raw_min is not None else 0
         self.batch_token_limit = hybrid_config.get("batch_token_limit", 7000)
-        self.auto_index_threshold = hybrid_config.get("auto_index_threshold", 10)
         self.auto_index = hybrid_config.get("auto_index", True)
         self._indexing_lock = threading.Lock()
-        self._idle_index_interval = _parse_interval(hybrid_config.get("idle_index_interval", 30))
+        self._idle_index_interval = _parse_interval(hybrid_config.get("idle_index_interval", "15min"))
         self._stop_event = threading.Event()
+        self._last_index_time = 0.0
         
         # 检查 sqlite-vec 可用性并加载扩展
         self.vec_available = self._load_vec_extension()
@@ -424,9 +427,7 @@ class HybridSessionSearch:
             batch_token_limit=self.batch_token_limit,
         )
         
-        # 启动后台自动索引守护线程
-        if self.auto_index and self.vec_available and self.api_key:
-            self._start_auto_index_daemon()
+
 
     def _role_filter_sql(self, table_alias: str = "m") -> tuple:
         return (
@@ -435,7 +436,7 @@ class HybridSessionSearch:
         )
 
     def _min_length_sql(self, table_alias: str = "m") -> str:
-        if self.min_content_length is not None and self.min_content_length > 0:
+        if self.min_content_length and self.min_content_length > 0:
             return f"AND LENGTH({table_alias}.content) >= {self.min_content_length} "
         return ""
     
@@ -804,15 +805,15 @@ class HybridSessionSearch:
             return 0
         
         try:
-            role_clause, role_params = self._role_filter_sql("")
-            min_len_clause = self._min_length_sql("")
+            role_clause, role_params = self._role_filter_sql("m")
+            min_len_clause = self._min_length_sql("m")
             vec_exists = self.db._conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='message_vec'"
             ).fetchone()
             
             if not vec_exists:
                 row = self.db._conn.execute(
-                    f"SELECT COUNT(*) as cnt FROM messages WHERE content IS NOT NULL {min_len_clause} {role_clause}",
+                    f"SELECT COUNT(*) as cnt FROM messages m WHERE m.content IS NOT NULL {min_len_clause} {role_clause}",
                     role_params
                 ).fetchone()
             else:
@@ -828,35 +829,65 @@ class HybridSessionSearch:
         except Exception:
             return 0
     
+    def _get_last_message_time(self) -> float:
+        try:
+            row = self.db._conn.execute(
+                "SELECT MAX(timestamp) as ts FROM messages"
+            ).fetchone()
+            ts = _row_get(row, "ts")
+            if ts is None:
+                return 0.0
+            if isinstance(ts, (int, float)):
+                return float(ts)
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(str(ts))
+                return dt.timestamp()
+            except Exception:
+                return 0.0
+        except Exception:
+            return 0.0
+
     def _start_auto_index_daemon(self):
         def _daemon_loop():
-            logger.info("Auto-index daemon started (interval=%ds, threshold=%d)",
-                         self._idle_index_interval, self.auto_index_threshold)
+            logger.info("Idle-index daemon started (interval=%ds)",
+                         self._idle_index_interval)
+            check_interval = min(self._idle_index_interval, 30)
             while not self._stop_event.is_set():
-                self._stop_event.wait(self._idle_index_interval)
+                self._stop_event.wait(check_interval)
                 if self._stop_event.is_set():
                     break
                 try:
                     if self._indexing_lock.locked():
                         continue
-                    count = self._count_unindexed()
-                    if count < self.auto_index_threshold:
+                    last_msg_time = self._get_last_message_time()
+                    if last_msg_time <= 0:
                         continue
-                    logger.info("Auto-index daemon: %d unindexed >= threshold %d, starting batch",
-                                 count, self.auto_index_threshold)
+                    now = time.time()
+                    idle_seconds = now - last_msg_time
+                    if idle_seconds < self._idle_index_interval:
+                        continue
+                    if last_msg_time <= self._last_index_time:
+                        continue
+                    count = self._count_unindexed()
+                    if count <= 0:
+                        continue
+                    logger.info("Idle-index daemon: idle %.0fs >= %ds, %d unindexed, starting batch",
+                                 idle_seconds, self._idle_index_interval, count)
                     if not self._indexing_lock.acquire(blocking=False):
                         continue
                     try:
                         items = self._fetch_unindexed(limit=500)
                         if items:
                             self.indexer.index_batch(items)
+                        self._last_index_time = last_msg_time
                     finally:
                         self._indexing_lock.release()
                 except Exception as e:
-                    logger.warning("Auto-index daemon error: %s", e)
-            logger.info("Auto-index daemon stopped")
+                    logger.warning("Idle-index daemon error: %s", e)
+            logger.info("Idle-index daemon stopped")
         
-        thread = threading.Thread(target=_daemon_loop, daemon=True, name="hybrid-auto-index")
+        thread = threading.Thread(target=_daemon_loop, daemon=True, name="hybrid-idle-index")
         thread.start()
     
     def stop_auto_index_daemon(self):
@@ -892,9 +923,9 @@ class HybridSessionSearch:
     
     def index_status(self) -> Dict[str, Any]:
         try:
-            role_clause, role_params = self._role_filter_sql("")
+            role_clause, role_params = self._role_filter_sql("m")
             total = self.db._conn.execute(
-                f"SELECT COUNT(*) as cnt FROM messages WHERE content IS NOT NULL {self._min_length_sql('')} {role_clause}",
+                f"SELECT COUNT(*) as cnt FROM messages m WHERE m.content IS NOT NULL {self._min_length_sql('m')} {role_clause}",
                 role_params
             ).fetchone()["cnt"]
             
@@ -920,7 +951,6 @@ class HybridSessionSearch:
                 "index_roles": self.index_roles,
                 "min_content_length": self.min_content_length,
                 "batch_token_limit": self.batch_token_limit,
-                "auto_index_threshold": self.auto_index_threshold,
                 "idle_index_interval": self._idle_index_interval,
             }
         except Exception as e:
@@ -943,6 +973,26 @@ class HybridSessionSearch:
         except Exception as e:
             logger.error("Rebuild index failed: %s", e, exc_info=True)
             return {"error": str(e)}
+
+
+def get_hybrid_search(db, config: dict = None) -> "HybridSessionSearch":
+    global _hybrid_instance
+    with _hybrid_lock:
+        if _hybrid_instance is not None:
+            return _hybrid_instance
+        instance = HybridSessionSearch(db, config=config or {})
+        if instance.auto_index and instance.vec_available and instance.api_key:
+            instance._start_auto_index_daemon()
+        _hybrid_instance = instance
+        return instance
+
+
+def reset_hybrid_search():
+    global _hybrid_instance
+    with _hybrid_lock:
+        if _hybrid_instance is not None:
+            _hybrid_instance.stop_auto_index_daemon()
+            _hybrid_instance = None
 
 
 def check_hybrid_search_requirements() -> bool:
