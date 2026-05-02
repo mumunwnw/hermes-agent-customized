@@ -9889,6 +9889,11 @@ class AIAgent:
                 return json.dumps({"success": False, "error": "Session database not available."})
             from tools.session_search_tool import hybrid_index_status as _status
             return _status(db=self._session_db)
+        elif function_name == "index_unindexed_messages":
+            if not self._session_db:
+                return json.dumps({"success": False, "error": "Session database not available."})
+            from tools.session_search_tool import index_unindexed_messages as _index
+            return _index(db=self._session_db, session_id=function_args.get("session_id"))
         elif function_name == "memory":
             target = function_args.get("target", "memory")
             from tools.memory_tool import memory_tool as _memory_tool
@@ -10535,6 +10540,15 @@ class AIAgent:
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('hybrid_index_status', function_args, tool_duration, result=function_result)}")
+            elif function_name == "index_unindexed_messages":
+                if not self._session_db:
+                    function_result = json.dumps({"success": False, "error": "Session database not available."})
+                else:
+                    from tools.session_search_tool import index_unindexed_messages as _index
+                    function_result = _index(db=self._session_db, session_id=function_args.get("session_id"))
+                tool_duration = time.time() - tool_start_time
+                if self._should_emit_quiet_tool_messages():
+                    self._vprint(f"  {_get_cute_tool_message_impl('index_unindexed_messages', function_args, tool_duration, result=function_result)}")
             elif function_name == "memory":
                 target = function_args.get("target", "memory")
                 from tools.memory_tool import memory_tool as _memory_tool
