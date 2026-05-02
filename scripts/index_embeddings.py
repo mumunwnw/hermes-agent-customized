@@ -47,7 +47,6 @@ def cmd_index(args):
         print("   2. Set SILICONFLOW_API_KEY or QMD_EMBED_API_KEY")
         sys.exit(1)
     
-    # Initialize database
     db_path = get_hermes_home() / "state.db"
     if not db_path.exists():
         print(f"❌ Session database not found: {db_path}")
@@ -56,46 +55,22 @@ def cmd_index(args):
     db = SessionDB(db_path)
     hybrid = HybridSessionSearch(db)
     
-    print("🔍 Indexing session embeddings...")
+    print("🔍 Indexing all unindexed messages...")
     
-    # Get all sessions
-    sessions = db.list_sessions_rich(limit=10000)
+    result = hybrid._index_unindexed_batch()
     
-    if not sessions:
-        print("ℹ️  No sessions found")
-        return
+    if result.get("error"):
+        print(f"❌ Indexing failed: {result['error']}")
+        sys.exit(1)
     
-    print(f"📊 Found {len(sessions)} sessions")
-    
-    indexed = 0
-    skipped = 0
-    failed = 0
-    
-    for session in sessions:
-        session_id = session.get("id", "")
-        if not session_id:
-            continue
-        
-        try:
-            # Get messages
-            messages = db.get_messages_as_conversation(session_id)
-            if not messages:
-                skipped += 1
-                continue
-            
-            hybrid.index_session(session_id)
-            indexed += 1
-            
-            print(f"✅ Indexed session {session_id} ({len(messages)} messages)")
-        
-        except Exception as e:
-            logger.error("Failed to index session %s: %s", session_id, e)
-            failed += 1
+    indexed = result.get("indexed", 0)
+    failed = result.get("failed", 0)
+    total = result.get("total_processed", 0)
     
     print(f"\n📊 Indexing Summary:")
     print(f"   ✅ Indexed: {indexed} messages")
-    print(f"   ⏭️  Skipped: {skipped} sessions")
-    print(f"   ❌ Failed: {failed} sessions")
+    print(f"   ❌ Failed: {failed} messages")
+    print(f"   📋 Total processed: {total} messages")
 
 
 def cmd_status(args):

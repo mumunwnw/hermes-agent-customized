@@ -71,31 +71,31 @@ session_search_tool.py
 ┌─────────────────────────────────────────────────────────────────┐
 │  Layer 1: 后台守护线程自动索引（Auto Index Daemon）                │
 │  触发：HybridSessionSearch 初始化时启动，独立于搜索运行            │
-│  逻辑：每 auto_index_interval 秒检查未索引消息数                   │
+│  逻辑：每 idle_index_interval 秒检查未索引消息数                   │
 │        未索引 >= auto_index_threshold → _fetch_unindexed          │
 │        → index_batch（按 token 分组，批量 API + 批量 DB 写入）     │
 │  特性：_indexing_lock 防并发，_stop_event 支持优雅停止             │
 │  优点：不依赖搜索触发，不遗漏，不阻塞主线程                        │
 │  配置：auto_index=true, auto_index_threshold=10,                  │
-│        auto_index_interval=30                                     │
+│        idle_index_interval="30s"                                  │
 └─────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────────┐
 │  Layer 2: 会话结束索引（Session Finalize Indexing）               │
 │  触发：on_session_finalize 钩子（CLI退出、/new、/reset等）         │
 │  实现：plugins/hybrid-search-indexer/ 插件                        │
-│  逻辑：index_session(session_id) → _index_unindexed_batch         │
-│  特性：限定 session_id，只索引该 session 的未索引消息              │
-│  优点：session 结束后立即可供搜索                                  │
+│  逻辑：index_session() → _index_unindexed_batch                   │
+│  特性：索引所有未索引消息（不限 session_id）                       │
+│  优点：session 结束后立即处理所有未索引消息                         │
 └─────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────────┐
 │  Layer 3: 手动触发索引（Manual Indexing）                         │
 │  触发：index_unindexed_messages 工具 / rebuild_hybrid_index 工具  │
 │  区别：index_unindexed_messages 增量索引，rebuild 重建全量索引     │
-│  参数：session_id 可选，限定某个 session                           │
+│  参数：无（索引所有未索引消息）                                     │
 └─────────────────────────────────────────────────────────────────┘
 
 所有路径统一经过：
-  _fetch_unindexed(session_id?, limit?) → 查询未索引消息
+  _fetch_unindexed(limit?) → 查询所有未索引消息
   → EmbeddingIndexer.index_batch(items) → 按 token 分组
   → _call_embedding_api_batch(texts) → 批量 embedding API
   → 批量 INSERT INTO message_vec
@@ -138,7 +138,7 @@ auxiliary:
       batch_token_limit: 7000
       auto_index: true
       auto_index_threshold: 10
-      auto_index_interval: 30
+      idle_index_interval: "30s"
 ```
 
 ### 配置字段职责
@@ -166,7 +166,7 @@ auxiliary:
 | `hybrid.batch_token_limit` | `hybrid_search.py` | 批量索引 token 预算，每组 API 调用不超过此值 | - |
 | `hybrid.auto_index` | `hybrid_search.py` | 自动索引总开关，false=禁用守护线程 | - |
 | `hybrid.auto_index_threshold` | `hybrid_search.py` | 未索引消息数达到此阈值时触发索引 | - |
-| `hybrid.auto_index_interval` | `hybrid_search.py` | 守护线程检查间隔（秒），推荐 10~300 | - |
+| `hybrid.idle_index_interval` | `hybrid_search.py` | 守护线程空闲检查间隔，支持人类可读格式 | - |
 
 ### 配置填写规范
 
@@ -180,7 +180,7 @@ auxiliary:
 | `batch_token_limit` | int | `7000` | `1000 ~ 8000` | bge-m3 上限 8192 tokens，7000留安全余量 |
 | `auto_index` | bool | `true` | `true` / `false` | false=禁用守护线程，只能手动触发索引 |
 | `auto_index_threshold` | int | `10` | `1 ~ 1000` | 未索引消息达到此数量时触发批量索引 |
-| `auto_index_interval` | int | `30` | `5 ~ 3600`（秒） | 守护线程轮询间隔；<5无意义（COUNT查询有开销）；>300可能延迟过大 |
+| `idle_index_interval` | int/float/string | `"30s"` | `"30s"`, `"15min"`, `"2hr"`, `"1h30m"`, `30` | 支持人类可读格式：数字+单位（s/sec/second, m/min/minute, h/hr/hour），可组合如"1h30m"；纯数字视为秒；最小5秒 |
 
 ## 文件清单
 
@@ -222,7 +222,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS message_vec USING vec0(
 | `session_search` | 搜索历史会话 | query, role_filter, limit | 始终可用 |
 | `rebuild_hybrid_index` | 重建向量索引（DROP+全量索引） | 无 | check_hybrid_search_requirements |
 | `hybrid_index_status` | 查看索引状态和诊断信息 | 无 | 始终可用 |
-| `index_unindexed_messages` | 增量索引未索引的消息 | session_id（可选） | check_hybrid_search_requirements |
+| `index_unindexed_messages` | 增量索引未索引的消息 | 无 | check_hybrid_search_requirements |
 
 所有 4 个工具均在 `_AGENT_LOOP_TOOLS` 中，由 `run_agent.py` 的 agent 循环直接调用，注入 `db=self._session_db`。
 
@@ -388,7 +388,7 @@ Phase 5: 批量索引与智能触发 ✅
   ├─ min_content_length 可配置（默认 null=不限） ✅
   ├─ 后台守护线程（auto_index_daemon）替代懒加载 ✅
   ├─ auto_index_threshold 阈值触发 ✅
-  ├─ auto_index_interval 轮询间隔 ✅
+  ├─ idle_index_interval 轮询间隔（支持人类可读格式） ✅
   ├─ _indexing_lock 防并发 ✅
   ├─ _fetch_unindexed 统一查询（替代3处重复SQL） ✅
   ├─ _index_unindexed_batch 统一批处理入口 ✅

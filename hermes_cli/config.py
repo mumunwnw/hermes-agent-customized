@@ -695,7 +695,7 @@ DEFAULT_CONFIG = {
                 "min_content_length": None,
                 "batch_token_limit": 7000,
                 "auto_index_threshold": 10,
-                "auto_index_interval": 30,
+                "idle_index_interval": "30s",
                 "auto_index": True,
             },
         },

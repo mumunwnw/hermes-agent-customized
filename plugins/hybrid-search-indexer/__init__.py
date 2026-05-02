@@ -5,8 +5,6 @@ logger = logging.getLogger(__name__)
 
 
 def _on_session_finalize(session_id: str = None, platform: str = "", **_: Any) -> None:
-    if not session_id:
-        return
     try:
         from hermes_cli.config import load_config
         config = load_config()
@@ -27,10 +25,9 @@ def _on_session_finalize(session_id: str = None, platform: str = "", **_: Any) -
         db_path = get_hermes_home() / "state.db"
         db = SessionDB(db_path)
         search = HybridSessionSearch(db, config=ss_config)
-        search.index_session(session_id)
+        search.index_session()
     except Exception as exc:
-        logger.warning("hybrid-search-indexer: failed for session %s: %s",
-                       session_id, exc)
+        logger.warning("hybrid-search-indexer: failed: %s", exc)
 
 
 def register(ctx) -> None:
