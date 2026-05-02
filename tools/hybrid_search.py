@@ -183,7 +183,17 @@ class EmbeddingIndexer:
         if not self.api_key:
             return None
         
+        if not text or not text.strip():
+            return None
+        
         import httpx
+        
+        truncated = text[:5000]
+        if len(text) > 5000:
+            try:
+                truncated = text[:5000].encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
+            except Exception:
+                truncated = text[:4900]
         
         for attempt in range(max_retries):
             try:
@@ -192,17 +202,21 @@ class EmbeddingIndexer:
                     headers={"Authorization": f"Bearer {self.api_key}"},
                     json={
                         "model": self.model,
-                        "input": text[:8000],  # 截断避免 token 限制
+                        "input": truncated,
                     },
                     timeout=30
                 )
                 
-                # 处理限流
                 if response.status_code == 429:
-                    wait_time = 2 ** attempt  # 指数退避
+                    wait_time = 2 ** attempt
                     logger.warning("Embedding API rate limited, waiting %ds", wait_time)
                     time.sleep(wait_time)
                     continue
+                
+                if response.status_code == 400:
+                    logger.warning("Embedding API 400 error for text length=%d (first 100 chars): %s",
+                                   len(truncated), truncated[:100])
+                    return None
                 
                 response.raise_for_status()
                 return response.json()["data"][0]["embedding"]
