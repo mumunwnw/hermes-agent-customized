@@ -371,3 +371,66 @@ class TestMinContentLength:
         search.db._conn.execute = mock_execute
         status = search.index_status()
         assert status["min_content_length"] == 30
+
+
+class TestBatchIndexing:
+    def test_estimate_tokens_with_known_count(self):
+        from tools.hybrid_search import EmbeddingIndexer
+        assert EmbeddingIndexer._estimate_tokens("hello", token_count=100) == 100
+
+    def test_estimate_tokens_without_count(self):
+        from tools.hybrid_search import EmbeddingIndexer
+        est = EmbeddingIndexer._estimate_tokens("hello world")
+        assert est > 0
+
+    def test_estimate_tokens_cjk(self):
+        from tools.hybrid_search import EmbeddingIndexer
+        cjk_est = EmbeddingIndexer._estimate_tokens("你好世界")
+        ascii_est = EmbeddingIndexer._estimate_tokens("abcd")
+        assert cjk_est > ascii_est
+
+    def test_group_into_batches_respects_limit(self):
+        from tools.hybrid_search import EmbeddingIndexer
+        indexer = EmbeddingIndexer(MagicMock(), "http://x", "model", "key",
+                                   batch_token_limit=100)
+        items = [
+            (1, "a" * 50, "s1", 40),
+            (2, "b" * 50, "s1", 40),
+            (3, "c" * 50, "s1", 40),
+        ]
+        batches = indexer._group_into_batches(items)
+        assert len(batches) == 2
+        assert len(batches[0]) == 2
+        assert len(batches[1]) == 1
+
+    def test_group_into_batches_single_item_exceeds_limit(self):
+        from tools.hybrid_search import EmbeddingIndexer
+        indexer = EmbeddingIndexer(MagicMock(), "http://x", "model", "key",
+                                   batch_token_limit=100)
+        items = [(1, "x" * 1000, "s1", 500)]
+        batches = indexer._group_into_batches(items)
+        assert len(batches) == 1
+        assert len(batches[0]) == 1
+
+    def test_truncate_to_token_budget(self):
+        from tools.hybrid_search import EmbeddingIndexer
+        indexer = EmbeddingIndexer(MagicMock(), "http://x", "model", "key")
+        long_text = "a" * 20000
+        truncated = indexer._truncate_to_token_budget(long_text, 1000)
+        assert len(truncated) < len(long_text)
+        assert len(truncated) > 0
+
+    def test_truncate_preserves_short_text(self):
+        from tools.hybrid_search import EmbeddingIndexer
+        indexer = EmbeddingIndexer(MagicMock(), "http://x", "model", "key")
+        short = "hello world"
+        result = indexer._truncate_to_token_budget(short, 8192)
+        assert result == short
+
+    def test_batch_token_limit_config(self):
+        search = _make_search(config={"hybrid": {"batch_token_limit": 5000}})
+        assert search.batch_token_limit == 5000
+
+    def test_batch_token_limit_default(self):
+        search = _make_search()
+        assert search.batch_token_limit == 7000

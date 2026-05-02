@@ -693,6 +693,7 @@ DEFAULT_CONFIG = {
                 "rrf_score_threshold": 0.0,
                 "index_roles": ["user", "assistant"],
                 "min_content_length": None,
+                "batch_token_limit": 7000,
                 "auto_index": True,
             },
         },
