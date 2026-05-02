@@ -482,7 +482,10 @@ class HybridSessionSearch:
         self.min_content_length = int(_raw_min) if _raw_min is not None else None
         self.batch_token_limit = hybrid_config.get("batch_token_limit", 7000)
         self.auto_index_threshold = hybrid_config.get("auto_index_threshold", 10)
+        self.auto_index = hybrid_config.get("auto_index", True)
         self._indexing_lock = threading.Lock()
+        self._auto_index_interval = hybrid_config.get("auto_index_interval", 30)
+        self._stop_event = threading.Event()
         
         # 检查 sqlite-vec 可用性并加载扩展
         self.vec_available = self._load_vec_extension()
@@ -495,6 +498,10 @@ class HybridSessionSearch:
             min_content_length=self.min_content_length,
             batch_token_limit=self.batch_token_limit,
         )
+        
+        # 启动后台自动索引守护线程
+        if self.auto_index and self.vec_available and self.api_key:
+            self._start_auto_index_daemon()
 
     def _role_filter_sql(self, table_alias: str = "m") -> tuple:
         return (
@@ -747,8 +754,6 @@ class HybridSessionSearch:
         
         query = query.strip()
         
-        self._maybe_auto_index()
-        
         bm25_results = self._bm25_search(query, limit=50)
         vector_results_raw = self._vector_search(query, limit=50)
         vec_before_threshold = len(vector_results_raw)
@@ -906,33 +911,39 @@ class HybridSessionSearch:
         except Exception:
             return 0
     
-    def _maybe_auto_index(self):
-        if not self.vec_available or not self.api_key:
-            return
-        if not self.auto_index:
-            return
-        if self._indexing_lock.locked():
-            return
+    def _start_auto_index_daemon(self):
+        def _daemon_loop():
+            logger.info("Auto-index daemon started (interval=%ds, threshold=%d)",
+                         self._auto_index_interval, self.auto_index_threshold)
+            while not self._stop_event.is_set():
+                self._stop_event.wait(self._auto_index_interval)
+                if self._stop_event.is_set():
+                    break
+                try:
+                    if self._indexing_lock.locked():
+                        continue
+                    count = self._count_unindexed()
+                    if count < self.auto_index_threshold:
+                        continue
+                    logger.info("Auto-index daemon: %d unindexed >= threshold %d, starting batch",
+                                 count, self.auto_index_threshold)
+                    if not self._indexing_lock.acquire(blocking=False):
+                        continue
+                    try:
+                        items = self._fetch_unindexed(limit=500)
+                        if items:
+                            self.indexer.index_batch(items)
+                    finally:
+                        self._indexing_lock.release()
+                except Exception as e:
+                    logger.warning("Auto-index daemon error: %s", e)
+            logger.info("Auto-index daemon stopped")
         
-        count = self._count_unindexed()
-        if count < self.auto_index_threshold:
-            return
-        
-        logger.info("Auto-indexing triggered: %d unindexed messages >= threshold %d",
-                     count, self.auto_index_threshold)
-        
-        def _bg_index():
-            if not self._indexing_lock.acquire(blocking=False):
-                return
-            try:
-                items = self._fetch_unindexed(limit=500)
-                if items:
-                    self.indexer.index_batch(items)
-            finally:
-                self._indexing_lock.release()
-        
-        thread = threading.Thread(target=_bg_index, daemon=True)
+        thread = threading.Thread(target=_daemon_loop, daemon=True, name="hybrid-auto-index")
         thread.start()
+    
+    def stop_auto_index_daemon(self):
+        self._stop_event.set()
     
     def _index_unindexed_batch(self, session_id: str = None, limit: int = None) -> Dict[str, Any]:
         if not self.vec_available or not self.api_key:
@@ -996,6 +1007,7 @@ class HybridSessionSearch:
                 "min_content_length": self.min_content_length,
                 "batch_token_limit": self.batch_token_limit,
                 "auto_index_threshold": self.auto_index_threshold,
+                "auto_index_interval": self._auto_index_interval,
             }
         except Exception as e:
             return {"error": str(e)}

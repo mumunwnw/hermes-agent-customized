@@ -126,6 +126,7 @@ auxiliary:
       min_content_length: null
       batch_token_limit: 7000
       auto_index_threshold: 10
+      auto_index_interval: 30
       auto_index: true
 ```
 
@@ -152,6 +153,7 @@ auxiliary:
 | `hybrid.index_roles` | `hybrid_search.py` | 索引的消息角色，默认排除 tool 输出 | - |
 | `hybrid.min_content_length` | `hybrid_search.py` | 最低索引内容长度，null=不限 | - |
 | `hybrid.batch_token_limit` | `hybrid_search.py` | 批量索引 token 预算，每组 API 调用不超过此值 | - |
+| `hybrid.auto_index_threshold` | `hybrid_search.py` | 未索引消息数达到此阈值时自动触发后台索引 | - |
 
 ## 文件清单
 
