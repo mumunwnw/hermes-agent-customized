@@ -953,18 +953,13 @@ INDEX_UNINDEXED_MESSAGES_SCHEMA = {
     ),
     "parameters": {
         "type": "object",
-        "properties": {
-            "session_id": {
-                "type": "string",
-                "description": "Only index messages from this session. Omit to index all unindexed messages.",
-            },
-        },
+        "properties": {},
         "required": [],
     },
 }
 
 
-def index_unindexed_messages(db=None, session_id: str = None) -> str:
+def index_unindexed_messages(db=None) -> str:
     from tools.hybrid_search import HybridSessionSearch, check_hybrid_search_requirements
     available = check_hybrid_search_requirements()
     if not available:
@@ -978,7 +973,7 @@ def index_unindexed_messages(db=None, session_id: str = None) -> str:
     except Exception:
         config = {}
     hybrid = HybridSessionSearch(db, config=config)
-    result = hybrid._index_unindexed_batch(session_id=session_id)
+    result = hybrid._index_unindexed_batch()
     result["success"] = True
     return json.dumps(result, ensure_ascii=False)
 
@@ -989,7 +984,6 @@ registry.register(
     schema=INDEX_UNINDEXED_MESSAGES_SCHEMA,
     handler=lambda args, **kw: index_unindexed_messages(
         db=kw.get("db"),
-        session_id=args.get("session_id"),
     ),
     check_fn=check_hybrid_search_requirements,
     emoji="📇",

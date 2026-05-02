@@ -40,6 +40,53 @@ def _row_get(row, key, default=None):
         return default
 
 
+def _parse_interval(value) -> int:
+    """Parse time interval config to seconds.
+    
+    Accepts:
+      - int/float: raw seconds (30 → 30)
+      - str with units: "30s", "15min", "2hr", "1h30m"
+      - str plain number: "30" → 30
+    Returns seconds as int. Minimum 5.
+    """
+    if isinstance(value, (int, float)):
+        return max(5, int(value))
+    
+    if not isinstance(value, str):
+        return 30
+    
+    s = value.strip().lower()
+    if not s:
+        return 30
+    
+    try:
+        return max(5, int(s))
+    except ValueError:
+        pass
+    
+    import re
+    total = 0
+    found = False
+    for match in re.finditer(r'(\d+(?:\.\d+)?)\s*(hr|h|hour|min|m|minute|s|sec|second)', s):
+        amount = float(match.group(1))
+        unit = match.group(2)
+        if unit in ('hr', 'h', 'hour'):
+            total += amount * 3600
+        elif unit in ('min', 'm', 'minute'):
+            total += amount * 60
+        elif unit in ('s', 'sec', 'second'):
+            total += amount
+        found = True
+    
+    if not found:
+        try:
+            total = int(s)
+        except ValueError:
+            return 30
+    
+    return max(5, int(total))
+
+
 def _vec_serialize(vector: List[float]) -> bytes:
     """Serialize float vector for sqlite-vec. Handles API name differences."""
     import sqlite_vec
@@ -362,7 +409,7 @@ class HybridSessionSearch:
         self.auto_index_threshold = hybrid_config.get("auto_index_threshold", 10)
         self.auto_index = hybrid_config.get("auto_index", True)
         self._indexing_lock = threading.Lock()
-        self._auto_index_interval = hybrid_config.get("auto_index_interval", 30)
+        self._idle_index_interval = _parse_interval(hybrid_config.get("idle_index_interval", 30))
         self._stop_event = threading.Event()
         
         # 检查 sqlite-vec 可用性并加载扩展
@@ -708,15 +755,13 @@ class HybridSessionSearch:
             logger.warning("Reranker failed: %s", e, exc_info=True)
             return candidates[:limit]
     
-    def _fetch_unindexed(self, session_id: str = None, limit: int = None) -> list:
+    def _fetch_unindexed(self, limit: int = None) -> list:
         if not self.vec_available or not self.api_key:
             return []
         
         self._ensure_vec_loaded()
         role_clause, role_params = self._role_filter_sql()
         min_len_clause = self._min_length_sql()
-        session_filter = "AND m.session_id = ? " if session_id else ""
-        session_params = [session_id] if session_id else []
         limit_clause = f"LIMIT ? " if limit else ""
         limit_params = [limit] if limit else []
         
@@ -729,10 +774,9 @@ class HybridSessionSearch:
                 rows = self.db._conn.execute(
                     f"""SELECT m.id, m.content, m.session_id, m.token_count FROM messages m
                        WHERE m.content IS NOT NULL {min_len_clause}
-                       {session_filter}
                        {role_clause}
                        ORDER BY m.timestamp DESC {limit_clause}""",
-                    session_params + role_params + limit_params
+                    role_params + limit_params
                 ).fetchall()
             else:
                 rows = self.db._conn.execute(
@@ -740,10 +784,9 @@ class HybridSessionSearch:
                        LEFT JOIN message_vec v ON m.id = v.message_id
                        WHERE v.message_id IS NULL
                          AND m.content IS NOT NULL {min_len_clause}
-                       {session_filter}
                        {role_clause}
                        ORDER BY m.timestamp DESC {limit_clause}""",
-                    session_params + role_params + limit_params
+                    role_params + limit_params
                 ).fetchall()
             
             return [(
@@ -788,9 +831,9 @@ class HybridSessionSearch:
     def _start_auto_index_daemon(self):
         def _daemon_loop():
             logger.info("Auto-index daemon started (interval=%ds, threshold=%d)",
-                         self._auto_index_interval, self.auto_index_threshold)
+                         self._idle_index_interval, self.auto_index_threshold)
             while not self._stop_event.is_set():
-                self._stop_event.wait(self._auto_index_interval)
+                self._stop_event.wait(self._idle_index_interval)
                 if self._stop_event.is_set():
                     break
                 try:
@@ -819,7 +862,7 @@ class HybridSessionSearch:
     def stop_auto_index_daemon(self):
         self._stop_event.set()
     
-    def _index_unindexed_batch(self, session_id: str = None, limit: int = None) -> Dict[str, Any]:
+    def _index_unindexed_batch(self, limit: int = None) -> Dict[str, Any]:
         if not self.vec_available or not self.api_key:
             return {"error": "hybrid search not available (sqlite-vec or API key missing)"}
         
@@ -827,7 +870,7 @@ class HybridSessionSearch:
             return {"error": "indexing already in progress"}
         
         with self._indexing_lock:
-            items = self._fetch_unindexed(session_id=session_id, limit=limit)
+            items = self._fetch_unindexed(limit=limit)
             if not items:
                 return {"indexed": 0, "message": "No unindexed messages found"}
             
@@ -842,12 +885,10 @@ class HybridSessionSearch:
                 "total_processed": len(items),
             }
     
-    def index_session(self, session_id: str):
-        if not session_id:
-            return
-        result = self._index_unindexed_batch(session_id=session_id)
+    def index_session(self, session_id: str = None):
+        result = self._index_unindexed_batch()
         if result.get("total_processed", 0) > 0:
-            logger.info("Indexed session %s: %s", session_id, result)
+            logger.info("Indexed messages: %s", result)
     
     def index_status(self) -> Dict[str, Any]:
         try:
@@ -880,7 +921,7 @@ class HybridSessionSearch:
                 "min_content_length": self.min_content_length,
                 "batch_token_limit": self.batch_token_limit,
                 "auto_index_threshold": self.auto_index_threshold,
-                "auto_index_interval": self._auto_index_interval,
+                "idle_index_interval": self._idle_index_interval,
             }
         except Exception as e:
             return {"error": str(e)}
