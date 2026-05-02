@@ -481,6 +481,8 @@ class HybridSessionSearch:
         _raw_min = hybrid_config.get("min_content_length")
         self.min_content_length = int(_raw_min) if _raw_min is not None else None
         self.batch_token_limit = hybrid_config.get("batch_token_limit", 7000)
+        self.auto_index_threshold = hybrid_config.get("auto_index_threshold", 10)
+        self._indexing_lock = threading.Lock()
         
         # 检查 sqlite-vec 可用性并加载扩展
         self.vec_available = self._load_vec_extension()
@@ -745,7 +747,7 @@ class HybridSessionSearch:
         
         query = query.strip()
         
-        self._lazy_index_unindexed()
+        self._maybe_auto_index()
         
         bm25_results = self._bm25_search(query, limit=50)
         vector_results_raw = self._vector_search(query, limit=50)
@@ -827,98 +829,140 @@ class HybridSessionSearch:
         """将消息加入索引队列（异步）。"""
         self.indexer.enqueue(message_id, content, session_id)
     
-    def _lazy_index_unindexed(self, max_messages: int = 500):
+    def _fetch_unindexed(self, session_id: str = None, limit: int = None) -> list:
         if not self.vec_available or not self.api_key:
-            return
+            return []
         
         self._ensure_vec_loaded()
         role_clause, role_params = self._role_filter_sql()
+        min_len_clause = self._min_length_sql()
+        session_filter = "AND m.session_id = ? " if session_id else ""
+        session_params = [session_id] if session_id else []
+        limit_clause = f"LIMIT ? " if limit else ""
+        limit_params = [limit] if limit else []
         
         try:
             vec_exists = self.db._conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='message_vec'"
             ).fetchone()
             
-            min_len_clause = self._min_length_sql()
-            
             if not vec_exists:
-                unindexed = self.db._conn.execute(
+                rows = self.db._conn.execute(
                     f"""SELECT m.id, m.content, m.session_id, m.token_count FROM messages m
                        WHERE m.content IS NOT NULL {min_len_clause}
+                       {session_filter}
                        {role_clause}
-                       ORDER BY m.timestamp DESC LIMIT ?""",
-                    role_params + [max_messages]
+                       ORDER BY m.timestamp DESC {limit_clause}""",
+                    session_params + role_params + limit_params
                 ).fetchall()
             else:
-                unindexed = self.db._conn.execute(
+                rows = self.db._conn.execute(
                     f"""SELECT m.id, m.content, m.session_id, m.token_count FROM messages m
                        LEFT JOIN message_vec v ON m.id = v.message_id
                        WHERE v.message_id IS NULL
                          AND m.content IS NOT NULL {min_len_clause}
+                       {session_filter}
                        {role_clause}
-                       ORDER BY m.timestamp DESC LIMIT ?""",
-                    role_params + [max_messages]
+                       ORDER BY m.timestamp DESC {limit_clause}""",
+                    session_params + role_params + limit_params
                 ).fetchall()
             
-            if not unindexed:
-                return
-            
-            items = [(
+            return [(
                 _row_get(row, "id"),
                 _row_get(row, "content"),
                 _row_get(row, "session_id"),
                 _row_get(row, "token_count"),
-            ) for row in unindexed]
-            
-            logger.info("Lazy-indexing %d unindexed messages (batch mode)", len(items))
-            self.indexer.index_batch(items)
+            ) for row in rows]
         except Exception as e:
-            logger.warning("Lazy indexing failed: %s", e, exc_info=True)
+            logger.warning("Failed to fetch unindexed messages: %s", e)
+            return []
     
-    def index_session(self, session_id: str):
+    def _count_unindexed(self) -> int:
         if not self.vec_available or not self.api_key:
-            return
-        
-        role_clause, role_params = self._role_filter_sql()
+            return 0
         
         try:
+            role_clause, role_params = self._role_filter_sql("")
+            min_len_clause = self._min_length_sql("")
             vec_exists = self.db._conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='message_vec'"
             ).fetchone()
             
             if not vec_exists:
-                unindexed = self.db._conn.execute(
-                    f"""SELECT m.id, m.content, m.session_id, m.token_count FROM messages m
-                       WHERE m.session_id = ?
-                         AND m.content IS NOT NULL {self._min_length_sql()}
-                       {role_clause}""",
-                    [session_id] + role_params
-                ).fetchall()
+                row = self.db._conn.execute(
+                    f"SELECT COUNT(*) as cnt FROM messages WHERE content IS NOT NULL {min_len_clause} {role_clause}",
+                    role_params
+                ).fetchone()
             else:
-                unindexed = self.db._conn.execute(
-                    f"""SELECT m.id, m.content, m.session_id, m.token_count FROM messages m
+                row = self.db._conn.execute(
+                    f"""SELECT COUNT(*) as cnt FROM messages m
                        LEFT JOIN message_vec v ON m.id = v.message_id
-                       WHERE m.session_id = ?
-                         AND v.message_id IS NULL
-                         AND m.content IS NOT NULL {self._min_length_sql()}
-                       {role_clause}""",
-                    [session_id] + role_params
-                ).fetchall()
+                       WHERE v.message_id IS NULL
+                         AND m.content IS NOT NULL {min_len_clause} {role_clause}""",
+                    role_params
+                ).fetchone()
             
-            if not unindexed:
+            return _row_get(row, "cnt", 0)
+        except Exception:
+            return 0
+    
+    def _maybe_auto_index(self):
+        if not self.vec_available or not self.api_key:
+            return
+        if not self.auto_index:
+            return
+        if self._indexing_lock.locked():
+            return
+        
+        count = self._count_unindexed()
+        if count < self.auto_index_threshold:
+            return
+        
+        logger.info("Auto-indexing triggered: %d unindexed messages >= threshold %d",
+                     count, self.auto_index_threshold)
+        
+        def _bg_index():
+            if not self._indexing_lock.acquire(blocking=False):
                 return
+            try:
+                items = self._fetch_unindexed(limit=500)
+                if items:
+                    self.indexer.index_batch(items)
+            finally:
+                self._indexing_lock.release()
+        
+        thread = threading.Thread(target=_bg_index, daemon=True)
+        thread.start()
+    
+    def _index_unindexed_batch(self, session_id: str = None, limit: int = None) -> Dict[str, Any]:
+        if not self.vec_available or not self.api_key:
+            return {"error": "hybrid search not available (sqlite-vec or API key missing)"}
+        
+        if self._indexing_lock.locked():
+            return {"error": "indexing already in progress"}
+        
+        with self._indexing_lock:
+            items = self._fetch_unindexed(session_id=session_id, limit=limit)
+            if not items:
+                return {"indexed": 0, "message": "No unindexed messages found"}
             
-            items = [(
-                _row_get(row, "id"),
-                _row_get(row, "content"),
-                _row_get(row, "session_id"),
-                _row_get(row, "token_count"),
-            ) for row in unindexed]
+            before_indexed = self.indexer.indexed_count
+            before_failed = self.indexer.failed_count
             
-            logger.info("Indexing %d messages for session %s (batch mode)", len(items), session_id)
             self.indexer.index_batch(items)
-        except Exception as e:
-            logger.warning("Session indexing failed for %s: %s", session_id, e, exc_info=True)
+            
+            return {
+                "indexed": self.indexer.indexed_count - before_indexed,
+                "failed": self.indexer.failed_count - before_failed,
+                "total_processed": len(items),
+            }
+    
+    def index_session(self, session_id: str):
+        if not session_id:
+            return
+        result = self._index_unindexed_batch(session_id=session_id)
+        if result.get("total_processed", 0) > 0:
+            logger.info("Indexed session %s: %s", session_id, result)
     
     def index_status(self) -> Dict[str, Any]:
         try:
@@ -951,6 +995,7 @@ class HybridSessionSearch:
                 "index_roles": self.index_roles,
                 "min_content_length": self.min_content_length,
                 "batch_token_limit": self.batch_token_limit,
+                "auto_index_threshold": self.auto_index_threshold,
             }
         except Exception as e:
             return {"error": str(e)}
@@ -960,7 +1005,6 @@ class HybridSessionSearch:
             return {"error": "hybrid search not available (sqlite-vec or API key missing)"}
         
         self._ensure_vec_loaded()
-        role_clause, role_params = self._role_filter_sql()
         
         try:
             self.db._conn.execute("DROP TABLE IF EXISTS message_vec")
@@ -969,34 +1013,7 @@ class HybridSessionSearch:
             
             self._load_vec_extension()
             
-            unindexed = self.db._conn.execute(
-                f"""SELECT m.id, m.content, m.session_id, m.token_count FROM messages m
-                   WHERE m.content IS NOT NULL {self._min_length_sql()}
-                   {role_clause}
-                   ORDER BY m.timestamp DESC""",
-                role_params
-            ).fetchall()
-            
-            if not unindexed:
-                return {"rebuilt": True, "indexed": 0, "message": "No messages to index"}
-            
-            items = [(
-                _row_get(row, "id"),
-                _row_get(row, "content"),
-                _row_get(row, "session_id"),
-                _row_get(row, "token_count"),
-            ) for row in unindexed]
-            
-            logger.info("Rebuilding hybrid index: %d messages (batch mode)", len(items))
-            self.indexer.index_batch(items)
-            
-            return {
-                "rebuilt": True,
-                "total_messages": len(unindexed),
-                "indexed": self.indexer.indexed_count,
-                "failed": self.indexer.failed_count,
-                "index_roles": self.index_roles,
-            }
+            return self._index_unindexed_batch()
         except Exception as e:
             logger.error("Rebuild index failed: %s", e, exc_info=True)
             return {"error": str(e)}

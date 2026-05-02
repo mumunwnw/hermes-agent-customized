@@ -694,6 +694,7 @@ DEFAULT_CONFIG = {
                 "index_roles": ["user", "assistant"],
                 "min_content_length": None,
                 "batch_token_limit": 7000,
+                "auto_index_threshold": 10,
                 "auto_index": True,
             },
         },

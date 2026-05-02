@@ -920,3 +920,56 @@ registry.register(
     check_fn=lambda: True,
     emoji="📊",
 )
+
+
+INDEX_UNINDEXED_MESSAGES_SCHEMA = {
+    "name": "index_unindexed_messages",
+    "description": (
+        "Index all unindexed messages into the hybrid search vector index. "
+        "Use this when hybrid search is not finding recent messages, "
+        "or after checking hybrid_index_status shows a large unindexed count. "
+        "This triggers batch embedding API calls and may take a while for large datasets."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "session_id": {
+                "type": "string",
+                "description": "Only index messages from this session. Omit to index all unindexed messages.",
+            },
+        },
+        "required": [],
+    },
+}
+
+
+def index_unindexed_messages(db=None, session_id: str = None) -> str:
+    from tools.hybrid_search import HybridSessionSearch, check_hybrid_search_requirements
+    available = check_hybrid_search_requirements()
+    if not available:
+        return json.dumps({
+            "success": False,
+            "error": "hybrid search not available (sqlite-vec or API key missing)",
+        }, ensure_ascii=False)
+    try:
+        from hermes_cli.config import load_config
+        config = load_config().get("auxiliary", {}).get("session_search", {})
+    except Exception:
+        config = {}
+    hybrid = HybridSessionSearch(db, config=config)
+    result = hybrid._index_unindexed_batch(session_id=session_id)
+    result["success"] = True
+    return json.dumps(result, ensure_ascii=False)
+
+
+registry.register(
+    name="index_unindexed_messages",
+    toolset="session_search",
+    schema=INDEX_UNINDEXED_MESSAGES_SCHEMA,
+    handler=lambda args, **kw: index_unindexed_messages(
+        db=kw.get("db"),
+        session_id=args.get("session_id"),
+    ),
+    check_fn=check_hybrid_search_requirements,
+    emoji="📇",
+)

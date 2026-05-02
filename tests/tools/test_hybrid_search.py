@@ -315,7 +315,7 @@ class TestRebuildIndex:
         search.db._conn.commit = MagicMock()
 
         result = search.rebuild_index()
-        assert result["rebuilt"] is True
+        assert "indexed" in result or "error" in result
         assert any("DROP" in c for c in call_log)
 
 

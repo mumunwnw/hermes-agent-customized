@@ -49,7 +49,7 @@ _HERMES_CORE_TOOLS = [
     # Planning & memory
     "todo", "memory",
     # Session history search
-    "session_search", "rebuild_hybrid_index", "hybrid_index_status",
+    "session_search", "rebuild_hybrid_index", "hybrid_index_status", "index_unindexed_messages",
     # Clarifying questions
     "clarify",
     # Code execution + delegation
@@ -171,7 +171,7 @@ TOOLSETS = {
     
     "session_search": {
         "description": "Search and recall past conversations with summarization",
-        "tools": ["session_search", "rebuild_hybrid_index", "hybrid_index_status"],
+        "tools": ["session_search", "rebuild_hybrid_index", "hybrid_index_status", "index_unindexed_messages"],
         "includes": []
     },
     

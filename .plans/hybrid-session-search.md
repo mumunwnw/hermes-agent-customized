@@ -125,6 +125,7 @@ auxiliary:
       index_roles: ["user", "assistant"]
       min_content_length: null
       batch_token_limit: 7000
+      auto_index_threshold: 10
       auto_index: true
 ```
 
@@ -150,6 +151,7 @@ auxiliary:
 | `hybrid.rrf_score_threshold` | `hybrid_search.py` | RRF 融合分数阈值，融合后质量门 | - |
 | `hybrid.index_roles` | `hybrid_search.py` | 索引的消息角色，默认排除 tool 输出 | - |
 | `hybrid.min_content_length` | `hybrid_search.py` | 最低索引内容长度，null=不限 | - |
+| `hybrid.batch_token_limit` | `hybrid_search.py` | 批量索引 token 预算，每组 API 调用不超过此值 | - |
 
 ## 文件清单
 
