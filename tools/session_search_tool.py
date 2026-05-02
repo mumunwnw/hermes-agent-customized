@@ -409,7 +409,11 @@ def _summarize_hybrid_sessions(
 def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
     """Return metadata for the most recent sessions (no LLM calls)."""
     try:
-        sessions = db.list_sessions_rich(limit=limit + 5, exclude_sources=list(_HIDDEN_SESSION_SOURCES))  # fetch extra to skip current
+        sessions = db.list_sessions_rich(
+            limit=limit + 5,
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            order_by_last_active=True,
+        )  # fetch extra to skip current
 
         # Resolve current session lineage to exclude it
         current_root = None
