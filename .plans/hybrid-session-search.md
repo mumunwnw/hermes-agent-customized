@@ -53,14 +53,14 @@ session_search_tool.py
   │   1. 读取 auxiliary.session_search 完整配置
   │   2. HybridSessionSearch(db, config=config)
   │      └─ _load_vec_extension() 加载 sqlite-vec
-  │   3. _lazy_index_unindexed() 懒索引未索引消息
-  │   4. search(query)
+  │      └─ _start_auto_index_daemon() 启动后台守护线程
+  │   3. search(query)
   │      ├─ BM25: db.search_messages() (FTS5)
   │      ├─ Vector: sqlite-vec KNN (vec_top_k + vec_distance_threshold)
   │      ├─ RRF: 融合排序
   │      ├─ RRF score threshold 过滤（可选，默认不过滤）
   │      └─ Reranker: 可选重排序
-  │   5. LLM 摘要（auxiliary_client，配置独立）
+  │   4. LLM 摘要（auxiliary_client，配置独立）
   │
   └─ engine == "auto" → 尝试 hybrid，失败回退 bm25
 ```
@@ -68,26 +68,37 @@ session_search_tool.py
 ## 索引机制
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Layer 1: 搜索时懒索引（Lazy Indexing）                       │
-│  触发：search() 调用时自动触发                                 │
-│  逻辑：LEFT JOIN message_vec 找未索引消息 → 异步入队 → 等待完成 │
-│  优点：零配置，搜索即索引，不遗漏                              │
-│  缺点：首次搜索有延迟                                        │
-└─────────────────────────────────────────────────────────────┘
-┌─────────────────────────────────────────────────────────────┐
-│  Layer 2: 会话结束批量索引（Batch Indexing）                   │
-│  触发：on_session_finalize 钩子（CLI退出、/new、/reset等）     │
-│  实现：plugins/hybrid-search-indexer/ 插件                    │
-│  逻辑：index_session(session_id) → 异步入队 → 后台线程处理     │
-│  优点：下次搜索无需等待                                      │
-│  缺点：需启用插件                                            │
-└─────────────────────────────────────────────────────────────┘
-┌─────────────────────────────────────────────────────────────┐
-│  Layer 3: 手动批量索引（Manual Batch Indexing）               │
-│  触发：scripts/index_embeddings.py                            │
-│  用途：首次启用 hybrid 时的全量索引                            │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  Layer 1: 后台守护线程自动索引（Auto Index Daemon）                │
+│  触发：HybridSessionSearch 初始化时启动，独立于搜索运行            │
+│  逻辑：每 auto_index_interval 秒检查未索引消息数                   │
+│        未索引 >= auto_index_threshold → _fetch_unindexed          │
+│        → index_batch（按 token 分组，批量 API + 批量 DB 写入）     │
+│  特性：_indexing_lock 防并发，_stop_event 支持优雅停止             │
+│  优点：不依赖搜索触发，不遗漏，不阻塞主线程                        │
+│  配置：auto_index=true, auto_index_threshold=10,                  │
+│        auto_index_interval=30                                     │
+└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  Layer 2: 会话结束索引（Session Finalize Indexing）               │
+│  触发：on_session_finalize 钩子（CLI退出、/new、/reset等）         │
+│  实现：plugins/hybrid-search-indexer/ 插件                        │
+│  逻辑：index_session(session_id) → _index_unindexed_batch         │
+│  特性：限定 session_id，只索引该 session 的未索引消息              │
+│  优点：session 结束后立即可供搜索                                  │
+└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  Layer 3: 手动触发索引（Manual Indexing）                         │
+│  触发：index_unindexed_messages 工具 / rebuild_hybrid_index 工具  │
+│  区别：index_unindexed_messages 增量索引，rebuild 重建全量索引     │
+│  参数：session_id 可选，限定某个 session                           │
+└─────────────────────────────────────────────────────────────────┘
+
+所有路径统一经过：
+  _fetch_unindexed(session_id?, limit?) → 查询未索引消息
+  → EmbeddingIndexer.index_batch(items) → 按 token 分组
+  → _call_embedding_api_batch(texts) → 批量 embedding API
+  → 批量 INSERT INTO message_vec
 ```
 
 ## 配置结构
@@ -125,9 +136,9 @@ auxiliary:
       index_roles: ["user", "assistant"]
       min_content_length: null
       batch_token_limit: 7000
+      auto_index: true
       auto_index_threshold: 10
       auto_index_interval: 30
-      auto_index: true
 ```
 
 ### 配置字段职责
@@ -153,8 +164,23 @@ auxiliary:
 | `hybrid.index_roles` | `hybrid_search.py` | 索引的消息角色，默认排除 tool 输出 | - |
 | `hybrid.min_content_length` | `hybrid_search.py` | 最低索引内容长度，null=不限 | - |
 | `hybrid.batch_token_limit` | `hybrid_search.py` | 批量索引 token 预算，每组 API 调用不超过此值 | - |
-| `hybrid.auto_index_threshold` | `hybrid_search.py` | 未索引消息数达到此阈值时自动触发后台索引 | - |
-| `hybrid.auto_index_interval` | `hybrid_search.py` | 后台守护线程检查间隔（秒） | - |
+| `hybrid.auto_index` | `hybrid_search.py` | 自动索引总开关，false=禁用守护线程 | - |
+| `hybrid.auto_index_threshold` | `hybrid_search.py` | 未索引消息数达到此阈值时触发索引 | - |
+| `hybrid.auto_index_interval` | `hybrid_search.py` | 守护线程检查间隔（秒），推荐 10~300 | - |
+
+### 配置填写规范
+
+| 字段 | 类型 | 默认值 | 范围/规范 | 说明 |
+|------|------|--------|-----------|------|
+| `engine` | string | `"bm25"` | `"bm25"` / `"hybrid"` / `"auto"` | auto=尝试hybrid，失败回退bm25 |
+| `vec_distance_threshold` | float | `1.2` | `0.5 ~ 2.0` | bge-m3 L2距离：相关<1.0，弱相关1.0~1.2，不相关>1.2 |
+| `rrf_score_threshold` | float | `0.0` | `0.0 ~ 0.05` | 小数据集区分度差，建议0.0；大数据集可设0.01~0.016 |
+| `index_roles` | list | `["user","assistant"]` | 任意 role 组合 | 排除 tool 输出可节省 API 成本和减少噪声 |
+| `min_content_length` | int/null | `null` | `null` 或正整数 | null=不限，任何长度都索引；设为50则跳过短消息 |
+| `batch_token_limit` | int | `7000` | `1000 ~ 8000` | bge-m3 上限 8192 tokens，7000留安全余量 |
+| `auto_index` | bool | `true` | `true` / `false` | false=禁用守护线程，只能手动触发索引 |
+| `auto_index_threshold` | int | `10` | `1 ~ 1000` | 未索引消息达到此数量时触发批量索引 |
+| `auto_index_interval` | int | `30` | `5 ~ 3600`（秒） | 守护线程轮询间隔；<5无意义（COUNT查询有开销）；>300可能延迟过大 |
 
 ## 文件清单
 
@@ -162,14 +188,17 @@ auxiliary:
 hermes-agent-customized/
 ├── hermes_cli/config.py                        # DEFAULT_CONFIG: auxiliary.session_search
 ├── tools/
-│   ├── session_search_tool.py                  # 路由 + 3个工具: session_search, rebuild_hybrid_index, hybrid_index_status
-│   └── hybrid_search.py                        # 核心: BM25+Vector+RRF+Reranker+Rebuild+Diagnostics
+│   ├── session_search_tool.py                  # 路由 + 4个工具
+│   └── hybrid_search.py                        # 核心: BM25+Vector+RRF+Reranker+Daemon+Diagnostics
 ├── plugins/
 │   └── hybrid-search-indexer/                  # 插件: on_session_finalize 钩子
 │       ├── plugin.yaml
 │       └── __init__.py
+├── model_tools.py                              # _AGENT_LOOP_TOOLS 注册
+├── run_agent.py                                # agent 循环直接调用（注入 db）
+├── toolsets.py                                 # 工具集声明
 └── scripts/
-    └── index_embeddings.py                     # 手动批量索引
+    └── index_embeddings.py                     # 手动批量索引脚本
 ```
 
 ## 数据库 Schema
@@ -181,6 +210,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS message_vec USING vec0(
     embedding FLOAT[1024],
     session_id TEXT
 );
+
+-- messages 表已有字段（由 hermes_state.py 管理）
+-- token_count INTEGER  ← 批量索引时用于 token 估算
 ```
 
 ## 注册工具
@@ -188,8 +220,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS message_vec USING vec0(
 | 工具名 | 功能 | 参数 | check_fn |
 |--------|------|------|----------|
 | `session_search` | 搜索历史会话 | query, role_filter, limit | 始终可用 |
-| `rebuild_hybrid_index` | 重建向量索引（DROP+重建+全量索引） | 无 | check_hybrid_search_requirements |
+| `rebuild_hybrid_index` | 重建向量索引（DROP+全量索引） | 无 | check_hybrid_search_requirements |
 | `hybrid_index_status` | 查看索引状态和诊断信息 | 无 | 始终可用 |
+| `index_unindexed_messages` | 增量索引未索引的消息 | session_id（可选） | check_hybrid_search_requirements |
+
+所有 4 个工具均在 `_AGENT_LOOP_TOOLS` 中，由 `run_agent.py` 的 agent 循环直接调用，注入 `db=self._session_db`。
 
 ### session_search 输出格式
 
@@ -203,6 +238,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS message_vec USING vec0(
   "diagnostics": {
     "bm25_hits": 5,
     "vector_hits": 3,
+    "vec_before_threshold": 8,
+    "vec_distance_threshold": 1.2,
+    "fused_before_rrf_threshold": 6,
+    "fused_after_rrf_threshold": 4,
+    "rrf_score_threshold": 0.0,
     "vec_available": true,
     "has_api_key": true
   }
@@ -210,12 +250,28 @@ CREATE VIRTUAL TABLE IF NOT EXISTS message_vec USING vec0(
 ```
 
 - `engine`: `"bm25"` 或 `"hybrid"`，明确告知使用了哪个引擎
-- `diagnostics`: 仅 hybrid 模式返回，包含各路搜索命中数和可用性信息
-- `diagnostics.vector_hits == 0` 表示向量搜索未贡献结果
+- `diagnostics`: hybrid 模式返回，包含各路搜索命中数、阈值过滤前后对比、可用性信息
+- `vec_before_threshold` / `vector_hits`: 向量搜索原始命中数 / 经过 vec_distance_threshold 过滤后数量
+- `fused_before_rrf_threshold` / `fused_after_rrf_threshold`: RRF 融合后 / rrf_score_threshold 过滤后数量
+
+### session_search 日志格式
+
+每次调用自动记录到 agent.log：
+
+```
+# hybrid 成功
+session_search query='deploy database' engine=hybrid count=2 bm25=5 vec_raw=8 vec_filtered=3 vec_thresh=1.2 fused_before=6 fused_after=4 summaries=['User discussed deploying...', 'Discussion about CI/CD...'] elapsed=0.25s
+
+# BM25 成功
+session_search query='deploy' engine=bm25 count=3 bm25=5 elapsed=0.35s
+
+# 失败
+session_search query='test' engine=bm25 count=0 error=Session database not available. elapsed=0.00s
+```
 
 ## 启用步骤
 
-1. 安装依赖：`pip install sqlite-vec pysqlite3-binary`
+1. 安装依赖：`pip install sqlite-vec pysqlite3`
 2. 配置 config.yaml：
    ```yaml
    auxiliary:
@@ -224,7 +280,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS message_vec USING vec0(
    ```
 3. 启用插件：`hermes plugins enable hybrid-search-indexer`
 4. 设置 API Key：`embed_api_key` 或 `SILICONFLOW_API_KEY` 环境变量
-5. 首次全量索引：`python scripts/index_embeddings.py index`
+5. 首次全量索引（可选，守护线程会自动处理）：`python scripts/index_embeddings.py index`
 
 ## 测试结果
 
@@ -296,7 +352,6 @@ Phase 1: 修复设计缺陷 ✅
   └─ QMD_* 环境变量清理
 
 Phase 2: 自动索引 ✅
-  ├─ 懒索引 _lazy_index_unindexed()
   ├─ 插件 hybrid-search-indexer
   └─ index_status()
 
@@ -324,8 +379,24 @@ Phase 4: Bug 修复与日志 ✅
   ├─ session_search 调用日志记录 → _log_and_return() 包装所有返回路径 ✅
   └─ 增强日志：bm25/vec命中数、threshold过滤前后、LLM摘要片段 ✅
 
-Phase 5: 优化 ⏭️
-  ├─ 智能消息过滤
+Phase 5: 批量索引与智能触发 ✅
+  ├─ Embedding API 批量调用（input 数组） ✅
+  ├─ 按 token 分组（batch_token_limit） ✅
+  ├─ token_count 字段利用（DB 已有） ✅
+  ├─ _truncate_to_token_budget 替代固定字符截断 ✅
+  ├─ 批量 400 自动降级逐条调用 ✅
+  ├─ min_content_length 可配置（默认 null=不限） ✅
+  ├─ 后台守护线程（auto_index_daemon）替代懒加载 ✅
+  ├─ auto_index_threshold 阈值触发 ✅
+  ├─ auto_index_interval 轮询间隔 ✅
+  ├─ _indexing_lock 防并发 ✅
+  ├─ _fetch_unindexed 统一查询（替代3处重复SQL） ✅
+  ├─ _index_unindexed_batch 统一批处理入口 ✅
+  ├─ index_unindexed_messages 工具 ✅
+  ├─ 移除 enqueue 队列（不再有丢弃消息问题） ✅
+  └─ 移除 _index_one 逐条索引（全部走 batch） ✅
+
+Phase 6: 优化 ⏭️
   ├─ 查询向量缓存
   └─ 孤立向量清理
 ```
