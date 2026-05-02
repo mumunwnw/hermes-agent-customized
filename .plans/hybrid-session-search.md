@@ -154,6 +154,7 @@ auxiliary:
 | `hybrid.min_content_length` | `hybrid_search.py` | 最低索引内容长度，null=不限 | - |
 | `hybrid.batch_token_limit` | `hybrid_search.py` | 批量索引 token 预算，每组 API 调用不超过此值 | - |
 | `hybrid.auto_index_threshold` | `hybrid_search.py` | 未索引消息数达到此阈值时自动触发后台索引 | - |
+| `hybrid.auto_index_interval` | `hybrid_search.py` | 后台守护线程检查间隔（秒） | - |
 
 ## 文件清单
 

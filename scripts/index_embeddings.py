@@ -83,14 +83,8 @@ def cmd_index(args):
                 skipped += 1
                 continue
             
-            # Index each message
-            for msg in messages:
-                msg_id = msg.get("id")
-                content = msg.get("content", "")
-                
-                if msg_id and content and len(content) > 50:
-                    hybrid.index_message_embedding(msg_id, content, session_id)
-                    indexed += 1
+            hybrid.index_session(session_id)
+            indexed += 1
             
             print(f"✅ Indexed session {session_id} ({len(messages)} messages)")
         

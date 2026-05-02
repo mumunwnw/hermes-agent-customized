@@ -17,7 +17,6 @@ Usage:
 import json
 import logging
 import os
-import queue
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -58,7 +57,7 @@ def _check_sqlite_vec_available() -> bool:
 
 
 class EmbeddingIndexer:
-    """异步 embedding 索引器 - 队列 + 批量消费者模式。"""
+    """Embedding 索引器 - 批量模式，由守护线程驱动。"""
     
     _MODEL_MAX_TOKENS = 8192
     
@@ -71,41 +70,8 @@ class EmbeddingIndexer:
         self.min_content_length = min_content_length
         self.batch_token_limit = batch_token_limit
         
-        self.queue = queue.Queue(maxsize=1000)
-        
         self.indexed_count = 0
         self.failed_count = 0
-        
-        self._start_worker()
-    
-    def _start_worker(self):
-        def _worker():
-            while True:
-                item = self.queue.get()
-                if item is None:
-                    break
-                
-                message_id, content, session_id, token_count = item
-                try:
-                    self._index_one(message_id, content, session_id, token_count)
-                    self.indexed_count += 1
-                except Exception as e:
-                    logger.warning("Failed to index message %d: %s", message_id, e)
-                    self.failed_count += 1
-                
-                self.queue.task_done()
-        
-        thread = threading.Thread(target=_worker, daemon=True)
-        thread.start()
-    
-    def enqueue(self, message_id: int, content: str, session_id: str, token_count: int = None):
-        if self.min_content_length is not None and self.min_content_length > 0 and len(content) < self.min_content_length:
-            return
-        
-        try:
-            self.queue.put_nowait((message_id, content, session_id, token_count))
-        except queue.Full:
-            logger.warning("Index queue full, dropping message %d", message_id)
     
     @staticmethod
     def _estimate_tokens(content: str, token_count: int = None) -> int:
@@ -126,82 +92,6 @@ class EmbeddingIndexer:
         except Exception:
             truncated = content[:max(1, char_limit - 100)]
         return truncated
-    
-    def _index_one(self, message_id: int, content: str, session_id: str, token_count: int = None):
-        try:
-            import sqlite_vec
-            
-            estimated_tokens = self._estimate_tokens(content, token_count)
-            
-            if estimated_tokens > self._MODEL_MAX_TOKENS:
-                content = self._truncate_to_token_budget(content, int(self._MODEL_MAX_TOKENS * 0.9))
-                if not content or not content.strip():
-                    return
-            
-            embedding = self._call_embedding_api_with_retry(content)
-            if not embedding:
-                return
-            
-            db_path = getattr(self.db, 'db_path', None) or getattr(self.db, '_db_path', None)
-            if not db_path:
-                try:
-                    row = self.db._conn.execute("PRAGMA database_list").fetchone()
-                    if row:
-                        db_path = row["file"] if hasattr(row, "keys") else row[2]
-                except Exception:
-                    pass
-            
-            if not db_path or db_path == "":
-                logger.warning("Cannot determine db path for background indexing")
-                return
-            
-            try:
-                from pysqlite3 import dbapi2 as pysqlite
-                conn = pysqlite.connect(db_path)
-                conn.enable_load_extension(True)
-                sqlite_vec.load(conn)
-                conn.enable_load_extension(False)
-            except ImportError:
-                import sqlite3
-                conn = sqlite3.connect(db_path)
-                try:
-                    conn.enable_load_extension(True)
-                    sqlite_vec.load(conn)
-                    conn.enable_load_extension(False)
-                except Exception:
-                    vec_path = sqlite_vec.loadable_path()
-                    if callable(vec_path):
-                        vec_path = vec_path()
-                    conn.load_extension(str(vec_path))
-                    try:
-                        conn.enable_load_extension(False)
-                    except AttributeError:
-                        pass
-            
-            vec_exists = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='message_vec'"
-            ).fetchone()
-            
-            if not vec_exists:
-                conn.execute(
-                    """CREATE VIRTUAL TABLE IF NOT EXISTS message_vec USING vec0(
-                        message_id INTEGER PRIMARY KEY,
-                        embedding FLOAT[1024],
-                        session_id TEXT
-                    )"""
-                )
-                conn.commit()
-            
-            conn.execute(
-                """INSERT OR REPLACE INTO message_vec 
-                   (message_id, embedding, session_id) 
-                   VALUES (?, ?, ?)""",
-                (message_id, _vec_serialize(embedding), session_id)
-            )
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            logger.warning("Failed to index message %d: %s", message_id, e)
     
     def index_batch(self, items: list):
         """批量索引：按 token 分组，每组一次 API 调用 + 一次 DB 写入。
@@ -428,18 +318,6 @@ class EmbeddingIndexer:
                     time.sleep(2 ** attempt)
         
         return None
-    
-    def wait_for_completion(self, timeout: int = 300):
-        """等待队列处理完成。"""
-        try:
-            self.queue.join()
-        except Exception:
-            pass
-    
-    def shutdown(self):
-        """关闭索引器。"""
-        self.queue.put(None)  # 发送停止信号
-
 
 class HybridSessionSearch:
     """混合搜索：BM25 + Vector + RRF。"""
@@ -830,10 +708,6 @@ class HybridSessionSearch:
             logger.warning("Reranker failed: %s", e, exc_info=True)
             return candidates[:limit]
     
-    def index_message_embedding(self, message_id: int, content: str, session_id: str):
-        """将消息加入索引队列（异步）。"""
-        self.indexer.enqueue(message_id, content, session_id)
-    
     def _fetch_unindexed(self, session_id: str = None, limit: int = None) -> list:
         if not self.vec_available or not self.api_key:
             return []
@@ -999,7 +873,6 @@ class HybridSessionSearch:
                 "indexed": indexed,
                 "unindexed": total - indexed,
                 "indexing_progress": f"{indexed}/{total}",
-                "queue_size": self.indexer.queue.qsize(),
                 "indexed_count": self.indexer.indexed_count,
                 "failed_count": self.indexer.failed_count,
                 "vec_available": self.vec_available,

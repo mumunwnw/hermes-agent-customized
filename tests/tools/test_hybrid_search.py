@@ -342,21 +342,6 @@ class TestMinContentLength:
         clause = search._min_length_sql()
         assert "LENGTH(m.content) >= 100" in clause
 
-    def test_enqueue_respects_min_length_none(self):
-        from tools.hybrid_search import EmbeddingIndexer
-        indexer = EmbeddingIndexer(MagicMock(), "http://x", "model", "key", min_content_length=None)
-        assert indexer.queue.qsize() == 0
-        indexer.enqueue(1, "hi", "s1")
-        assert indexer.queue.qsize() == 1
-
-    def test_enqueue_respects_min_length_set(self):
-        from tools.hybrid_search import EmbeddingIndexer
-        indexer = EmbeddingIndexer(MagicMock(), "http://x", "model", "key", min_content_length=50)
-        indexer.enqueue(1, "hi", "s1")
-        assert indexer.queue.qsize() == 0
-        indexer.enqueue(2, "a" * 50, "s1")
-        assert indexer.queue.qsize() == 1
-
     def test_index_status_includes_min_content_length(self):
         search = _make_search(config={"hybrid": {"min_content_length": 30}})
         def mock_execute(sql, *args):
