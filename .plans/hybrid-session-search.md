@@ -148,6 +148,7 @@ auxiliary:
 | `hybrid.vec_distance_threshold` | `hybrid_search.py` | 向量距离阈值（L2），融合前安全网 | - |
 | `hybrid.rrf_score_threshold` | `hybrid_search.py` | RRF 融合分数阈值，融合后质量门 | - |
 | `hybrid.index_roles` | `hybrid_search.py` | 索引的消息角色，默认排除 tool 输出 | - |
+| `hybrid.min_content_length` | `hybrid_search.py` | 最低索引内容长度，null=不限 | - |
 
 ## 文件清单
 
