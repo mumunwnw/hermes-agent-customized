@@ -320,19 +320,20 @@ class TestRebuildIndex:
 
 
 class TestMinContentLength:
-    def test_default_is_none(self):
+    def test_default_is_zero(self):
         search = _make_search()
-        assert search.min_content_length is None
+        assert search.min_content_length == 0
 
     def test_custom_value(self):
         search = _make_search(config={"hybrid": {"min_content_length": 30}})
         assert search.min_content_length == 30
 
-    def test_null_means_no_filter(self):
+    def test_zero_means_no_filter(self):
         search = _make_search()
+        assert search.min_content_length == 0
         assert search._min_length_sql() == ""
 
-    def test_zero_means_no_filter(self):
+    def test_zero_explicit_no_filter(self):
         search = _make_search(config={"hybrid": {"min_content_length": 0}})
         assert search.min_content_length == 0
         assert search._min_length_sql() == ""
