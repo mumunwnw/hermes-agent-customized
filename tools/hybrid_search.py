@@ -25,22 +25,7 @@ logger = logging.getLogger(__name__)
 
 _hybrid_instance = None
 _hybrid_lock = threading.Lock()
-
-
-def _row_get(row, key, default=None):
-    try:
-        return row[key]
-    except (TypeError, KeyError, IndexError):
-        if isinstance(row, (tuple, list)):
-            col_map = {
-                "id": 0, "message_id": 0, "session_id": 1,
-                "content": 2, "role": 3, "timestamp": 4,
-                "distance": 5, "file": 2, "name": 0, "cnt": 0,
-            }
-            idx = col_map.get(key)
-            if idx is not None and idx < len(row):
-                return row[idx]
-        return default
+_thread_local = threading.local()
 
 
 def _parse_interval(value) -> int:
@@ -220,7 +205,7 @@ class EmbeddingIndexer:
         conn = None
         try:
             from pysqlite3 import dbapi2 as pysqlite
-            conn = pysqlite.connect(db_path)
+            conn = pysqlite.connect(db_path, check_same_thread=False)
             conn.enable_load_extension(True)
             sqlite_vec.load(conn)
             conn.enable_load_extension(False)
@@ -259,7 +244,7 @@ class EmbeddingIndexer:
             
             for batch in batches:
                 if stop_event and stop_event.is_set():
-                    logger.info("Indexing batch aborted by stop event")
+                    logger.info("索引批量中止: 收到停止信号")
                     break
                 
                 texts = []
@@ -506,7 +491,7 @@ class HybridSessionSearch:
         # 检查 sqlite-vec 可用性并加载扩展
         self.vec_available = self._load_vec_extension()
         if not self.vec_available:
-            logger.warning("sqlite-vec not available, vector search disabled")
+            logger.warning("sqlite-vec 不可用，向量搜索已禁用")
         
         # 初始化索引器
         self.indexer = EmbeddingIndexer(
@@ -594,7 +579,7 @@ class HybridSessionSearch:
                     logger.warning("Cannot determine db_path for pysqlite3 connection swap, skipping")
                     return False
                 
-                new_conn = pysqlite.connect(db_path)
+                new_conn = pysqlite.connect(db_path, check_same_thread=False)
                 new_conn.enable_load_extension(True)
                 sqlite_vec.load(new_conn)
                 new_conn.enable_load_extension(False)
@@ -621,25 +606,43 @@ class HybridSessionSearch:
     
     def _bm25_search(self, query: str, limit: int = 50) -> List[Dict[str, Any]]:
         """BM25 关键词搜索（使用 FTS5）。"""
+        conn = self._thread_safe_conn()
+        if conn is None:
+            return []
         try:
-            results = self.db.search_messages(
-                query,
-                limit=limit,
-                offset=0,
-                role_filter=list(self.index_roles) if self.index_roles else None,
-            )
+            role_clause, role_params = self._role_filter_sql()
+            min_len_clause, min_len_params = self._min_length_sql()
             
-            # 转换为标准格式
+            fts_exists = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='messages_fts'"
+            ).fetchone()
+            if not fts_exists:
+                return []
+            
+            results = conn.execute(
+                f"""SELECT m.id, m.session_id, m.content, m.role, m.timestamp,
+                           bm25(messages_fts) as rank
+                    FROM messages_fts f
+                    JOIN messages m ON m.id = f.rowid
+                    WHERE messages_fts MATCH ?
+                    {role_clause}
+                    {min_len_clause}
+                    ORDER BY rank
+                    LIMIT ?""",
+                [query] + role_params + min_len_params + [limit]
+            ).fetchall()
+            
             formatted = []
             for r in results:
+                content = r[2] or ""
                 formatted.append({
-                    "message_id": r.get("id"),
-                    "session_id": r.get("session_id"),
-                    "content": r.get("content", ""),
-                    "role": r.get("role", ""),
-                    "timestamp": r.get("timestamp", 0),
-                    "snippet": r.get("snippet", ""),
-                    "bm25_rank": r.get("rank", 0),
+                    "message_id": r[0],
+                    "session_id": r[1],
+                    "content": content,
+                    "role": r[3],
+                    "timestamp": r[4],
+                    "snippet": content[:200] + "...",
+                    "bm25_rank": r[5],
                 })
             
             return formatted
@@ -690,7 +693,8 @@ class HybridSessionSearch:
         if not self.vec_available:
             return []
         
-        if not self._ensure_vec_loaded():
+        conn = self._thread_safe_conn()
+        if conn is None:
             return []
         
         query_embedding = self._call_embedding_api(query)
@@ -703,9 +707,7 @@ class HybridSessionSearch:
             return []
         
         try:
-            import sqlite_vec
-            
-            vec_exists = self.db._conn.execute(
+            vec_exists = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='message_vec'"
             ).fetchone()
             
@@ -716,7 +718,7 @@ class HybridSessionSearch:
             
             role_clause, role_params = self._role_filter_sql()
             
-            results = self.db._conn.execute(
+            results = conn.execute(
                 f"""SELECT m.id, m.session_id, m.content, m.role, m.timestamp,
                           distance
                    FROM message_vec
@@ -883,23 +885,92 @@ class HybridSessionSearch:
             logger.warning("Reranker failed: %s", e, exc_info=True)
             return candidates[:limit]
     
+    def _thread_safe_conn(self):
+        """Create a thread-safe read connection with sqlite-vec loaded.
+        
+        Uses a per-thread cached connection to avoid repeated extension
+        loading overhead during frequent searches. The cached connection
+        is stored in _thread_local and reused within the same thread.
+        Caller must NOT close the returned connection — it is managed
+        by this method.
+        Returns None if db path cannot be determined.
+        """
+        cached = getattr(_thread_local, 'hybrid_conn', None)
+        if cached is not None:
+            try:
+                cached.execute("SELECT 1").fetchone()
+                return cached
+            except Exception:
+                try:
+                    cached.close()
+                except Exception:
+                    pass
+                _thread_local.hybrid_conn = None
+        
+        db_path = getattr(self.db, 'db_path', None) or getattr(self.db, '_db_path', None)
+        if not db_path:
+            try:
+                from hermes_constants import get_hermes_home
+                candidate = get_hermes_home() / "state.db"
+                if candidate.exists():
+                    db_path = str(candidate)
+            except Exception:
+                pass
+        if not db_path:
+            try:
+                row = self.db._conn.execute("PRAGMA database_list").fetchone()
+                if row:
+                    db_path = row["file"] if hasattr(row, "keys") else row[2]
+            except Exception:
+                pass
+        if not db_path:
+            return None
+        
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        
+        if self.vec_available:
+            try:
+                import sqlite_vec
+                try:
+                    conn.enable_load_extension(True)
+                except AttributeError:
+                    pass
+                try:
+                    sqlite_vec.load(conn)
+                    try:
+                        conn.enable_load_extension(False)
+                    except AttributeError:
+                        pass
+                except Exception:
+                    pass
+            except ImportError:
+                pass
+        
+        _thread_local.hybrid_conn = conn
+        return conn
+
     def _fetch_unindexed(self, limit: int = None) -> list:
         if not self.vec_available or not self.api_key:
             return []
         
-        self._ensure_vec_loaded()
-        role_clause, role_params = self._role_filter_sql()
-        min_len_clause, min_len_params = self._min_length_sql()
-        limit_clause = f"LIMIT ? " if limit else ""
-        limit_params = [limit] if limit else []
+        conn = self._thread_safe_conn()
+        if conn is None:
+            return []
         
         try:
-            vec_exists = self.db._conn.execute(
+            role_clause, role_params = self._role_filter_sql()
+            min_len_clause, min_len_params = self._min_length_sql()
+            limit_clause = f"LIMIT ? " if limit else ""
+            limit_params = [limit] if limit else []
+            
+            vec_exists = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='message_vec'"
             ).fetchone()
             
             if not vec_exists:
-                rows = self.db._conn.execute(
+                rows = conn.execute(
                     f"""SELECT m.id, m.content, m.session_id, m.token_count FROM messages m
                        WHERE m.content IS NOT NULL {min_len_clause}
                        {role_clause}
@@ -907,7 +978,7 @@ class HybridSessionSearch:
                     min_len_params + role_params + limit_params
                 ).fetchall()
             else:
-                rows = self.db._conn.execute(
+                rows = conn.execute(
                     f"""SELECT m.id, m.content, m.session_id, m.token_count FROM messages m
                        LEFT JOIN message_vec v ON m.id = v.message_id
                        WHERE v.message_id IS NULL
@@ -929,23 +1000,24 @@ class HybridSessionSearch:
         if not self.vec_available or not self.api_key:
             return 0
         
-        if not self._ensure_vec_loaded():
+        conn = self._thread_safe_conn()
+        if conn is None:
             return 0
         
         try:
             role_clause, role_params = self._role_filter_sql("m")
             min_len_clause, min_len_params = self._min_length_sql("m")
-            vec_exists = self.db._conn.execute(
+            vec_exists = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='message_vec'"
             ).fetchone()
             
             if not vec_exists:
-                row = self.db._conn.execute(
+                row = conn.execute(
                     f"SELECT COUNT(*) as cnt FROM messages m WHERE m.content IS NOT NULL {min_len_clause} {role_clause}",
                     min_len_params + role_params
                 ).fetchone()
             else:
-                row = self.db._conn.execute(
+                row = conn.execute(
                     f"""SELECT COUNT(*) as cnt FROM messages m
                        LEFT JOIN message_vec v ON m.id = v.message_id
                        WHERE v.message_id IS NULL
@@ -958,8 +1030,11 @@ class HybridSessionSearch:
             return 0
     
     def _get_last_message_time(self) -> float:
+        conn = self._thread_safe_conn()
+        if conn is None:
+            return 0.0
         try:
-            row = self.db._conn.execute(
+            row = conn.execute(
                 "SELECT MAX(timestamp) as ts FROM messages"
             ).fetchone()
             ts = row[0] if row else None
@@ -978,7 +1053,7 @@ class HybridSessionSearch:
 
     def _start_auto_index_daemon(self):
         def _daemon_loop():
-            logger.info("Idle-index daemon started (interval=%ds)",
+            logger.info("空闲索引守护线程已启动 (间隔=%ds)",
                          self._idle_index_interval)
             check_interval = min(self._idle_index_interval, 30)
             while not self._stop_event.is_set():
@@ -998,7 +1073,7 @@ class HybridSessionSearch:
                     count = self._count_unindexed()
                     if count <= 0:
                         continue
-                    logger.info("Idle-index daemon: idle %.0fs >= %ds, %d unindexed, starting batch",
+                    logger.info("空闲索引: 空闲 %.0fs >= %ds, %d 条未索引, 开始批量索引",
                                  idle_seconds, self._idle_index_interval, count)
                     if not self._indexing_lock.acquire(blocking=False):
                         continue
@@ -1014,7 +1089,7 @@ class HybridSessionSearch:
                         self._indexing_lock.release()
                 except Exception as e:
                     logger.warning("Idle-index daemon error: %s", e)
-            logger.info("Idle-index daemon stopped")
+            logger.info("空闲索引守护线程已停止")
         
         thread = threading.Thread(target=_daemon_loop, daemon=True, name="hybrid-idle-index")
         thread.start()
@@ -1050,29 +1125,30 @@ class HybridSessionSearch:
     def index_session(self, session_id: str = None):
         result = self._index_unindexed_batch()
         if result.get("total_processed", 0) > 0:
-            logger.info("Indexed messages: %s", result)
+            logger.info("索引完成: %s", result)
     
     def index_status(self) -> Dict[str, Any]:
+        conn = self._thread_safe_conn()
+        if conn is None:
+            return {"error": "Cannot connect to database"}
         try:
             role_clause, role_params = self._role_filter_sql("m")
             min_len_clause, min_len_params = self._min_length_sql("m")
-            total_row = self.db._conn.execute(
+            total_row = conn.execute(
                 f"SELECT COUNT(*) as cnt FROM messages m WHERE m.content IS NOT NULL {min_len_clause} {role_clause}",
                 min_len_params + role_params
             ).fetchone()
-            total = (total_row["cnt"] if hasattr(total_row, "__contains__") and "cnt" in total_row
-                     else total_row[0]) if total_row else 0
+            total = total_row[0] if total_row else 0
             
-            vec_exists = self.db._conn.execute(
+            vec_exists = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='message_vec'"
             ).fetchone()
             
             if vec_exists:
-                idx_row = self.db._conn.execute(
+                idx_row = conn.execute(
                     "SELECT COUNT(*) as cnt FROM message_vec"
                 ).fetchone()
-                indexed = (idx_row["cnt"] if hasattr(idx_row, "__contains__") and "cnt" in idx_row
-                           else idx_row[0]) if idx_row else 0
+                indexed = idx_row[0] if idx_row else 0
             else:
                 indexed = 0
             
@@ -1101,16 +1177,36 @@ class HybridSessionSearch:
             return {"error": "indexing already in progress, cannot rebuild now"}
         
         try:
-            self._ensure_vec_loaded()
+            import sqlite3
+            db_path = getattr(self.db, 'db_path', None) or getattr(self.db, '_db_path', None)
+            if not db_path:
+                try:
+                    from hermes_constants import get_hermes_home
+                    db_path = str(get_hermes_home() / "state.db")
+                except Exception:
+                    pass
+            if not db_path:
+                return {"error": "Cannot determine db path for rebuild"}
             
-            self.db._conn.execute("DROP TABLE IF EXISTS message_vec")
-            self.db._conn.commit()
-            logger.info("Dropped message_vec table for rebuild")
+            write_conn = sqlite3.connect(db_path)
+            try:
+                write_conn.execute("DROP TABLE IF EXISTS message_vec")
+                write_conn.commit()
+                logger.info("已删除 message_vec 表，准备重建索引")
+            finally:
+                try:
+                    write_conn.close()
+                except Exception:
+                    pass
             
-            self._ensure_vec_loaded()
+            cached = getattr(_thread_local, 'hybrid_conn', None)
+            if cached is not None:
+                try:
+                    cached.close()
+                except Exception:
+                    pass
+                _thread_local.hybrid_conn = None
             
-            # Inline the indexing logic instead of calling _index_unindexed_batch
-            # which would try to re-acquire _indexing_lock (non-reentrant deadlock)
             items = self._fetch_unindexed()
             if not items:
                 return {"indexed": 0, "message": "No messages to index after rebuild"}
@@ -1158,7 +1254,7 @@ def reset_hybrid_search():
 def check_hybrid_search_requirements() -> bool:
     """检查混合搜索是否可用。"""
     if not _check_sqlite_vec_available():
-        logger.info("hybrid search unavailable: sqlite-vec not installed")
+        logger.info("混合搜索不可用: sqlite-vec 未安装")
         return False
     
     api_key = os.environ.get("SILICONFLOW_API_KEY", "")
@@ -1172,7 +1268,7 @@ def check_hybrid_search_requirements() -> bool:
             pass
     
     if not api_key:
-        logger.info("hybrid search unavailable: no embed API key configured")
+        logger.info("混合搜索不可用: 未配置 embedding API 密钥")
         return False
     
     return True

@@ -560,49 +560,55 @@ def session_search(
         except (json.JSONDecodeError, TypeError):
             pass
 
-        parts = [f"session_search query={query!r} engine={_search_engine} count={_search_result_count}"]
+        engine_label = {"bm25": "关键词", "hybrid": "混合"}.get(_search_engine, _search_engine)
+        
         if _search_error:
-            parts.append(f"error={_search_error}")
+            logging.info(
+                "🔍 会话搜索 | 查询=%r | 引擎=%s | 结果=失败 | 错误=%s | 耗时=%.1fs",
+                query, engine_label, _search_error, elapsed
+            )
+        else:
+            diag = {}
+            try:
+                diag = parsed.get("diagnostics", {}) or {}
+            except Exception:
+                pass
 
-        try:
-            diag = parsed.get("diagnostics", {})
-            if diag:
-                bm25_hits = diag.get("bm25_hits")
-                vec_hits = diag.get("vector_hits")
-                vec_before = diag.get("vec_before_threshold")
-                vec_thresh = diag.get("vec_distance_threshold")
-                fused_before = diag.get("fused_before_rrf_threshold")
-                fused_after = diag.get("fused_after_rrf_threshold")
-                rrf_thresh = diag.get("rrf_score_threshold")
-                if bm25_hits is not None:
-                    parts.append(f"bm25={bm25_hits}")
-                if vec_before is not None:
-                    parts.append(f"vec_raw={vec_before}")
-                if vec_hits is not None:
-                    parts.append(f"vec_filtered={vec_hits}")
-                if vec_thresh is not None:
-                    parts.append(f"vec_thresh={vec_thresh}")
-                if fused_before is not None:
-                    parts.append(f"fused_before={fused_before}")
-                if fused_after is not None:
-                    parts.append(f"fused_after={fused_after}")
-                if rrf_thresh is not None and rrf_thresh > 0:
-                    parts.append(f"rrf_thresh={rrf_thresh}")
-        except Exception:
-            pass
+            if _search_engine == "hybrid" and diag:
+                bm25 = diag.get("bm25_hits", 0)
+                vec_raw = diag.get("vec_before_threshold", 0)
+                vec_filtered = diag.get("vector_hits", 0)
+                vec_thresh = diag.get("vec_distance_threshold", 0)
+                fused_before = diag.get("fused_before_rrf_threshold", 0)
+                fused_after = diag.get("fused_after_rrf_threshold", 0)
+                rrf_thresh = diag.get("rrf_score_threshold", 0)
+                
+                detail_parts = [f"BM25命中={bm25}"]
+                detail_parts.append(f"向量原始={vec_raw}")
+                if vec_raw != vec_filtered:
+                    detail_parts.append(f"向量过滤后={vec_filtered}(阈值={vec_thresh})")
+                detail_parts.append(f"融合前={fused_before}")
+                if rrf_thresh > 0:
+                    detail_parts.append(f"RRF过滤后={fused_after}(阈值={rrf_thresh})")
+                detail = " | ".join(detail_parts)
+                
+                logging.info(
+                    "🔍 会话搜索 | 查询=%r | 引擎=混合 | 结果=%d条 | %s | 耗时=%.1fs",
+                    query, _search_result_count, detail, elapsed
+                )
+            elif _search_engine == "bm25" and diag:
+                bm25 = diag.get("bm25_hits", 0)
+                sessions = diag.get("sessions_after_dedup", 0)
+                logging.info(
+                    "🔍 会话搜索 | 查询=%r | 引擎=关键词 | 结果=%d条 | BM25命中=%d | 去重后=%d个会话 | 耗时=%.1fs",
+                    query, _search_result_count, bm25, sessions, elapsed
+                )
+            else:
+                logging.info(
+                    "🔍 会话搜索 | 查询=%r | 引擎=%s | 结果=%d条 | 耗时=%.1fs",
+                    query, engine_label, _search_result_count, elapsed
+                )
 
-        results_list = parsed.get("results", [])
-        if results_list and isinstance(results_list, list):
-            summary_snippets = []
-            for r in results_list[:3]:
-                s = r.get("summary", "")
-                if s:
-                    summary_snippets.append(s[:80].replace("\n", " "))
-            if summary_snippets:
-                parts.append(f"summaries={summary_snippets}")
-
-        parts.append(f"elapsed={elapsed:.2f}s")
-        logging.info(" ".join(parts))
         return result_str
 
     if db is None:
