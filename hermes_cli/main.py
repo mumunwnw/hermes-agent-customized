@@ -7331,33 +7331,41 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # _sync_with_upstream_if_needed operates on main branch (git pull upstream main),
             # so we must switch to main first, then switch back and merge into stable.
             saved_branch = branch
-            subprocess.run(
+            checkout_main = subprocess.run(
                 git_cmd + ["checkout", "main"],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
                 check=False,
             )
-            _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
-            subprocess.run(
-                git_cmd + ["checkout", saved_branch],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            # Merge updated main into stable
-            merge_result = subprocess.run(
-                git_cmd + ["merge", "main", "--no-edit"],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-            )
-            if merge_result.returncode == 0:
-                print("  ✓ Merged upstream updates into stable")
+            if checkout_main.returncode != 0:
+                print(f"  ⚠ Failed to checkout main: {checkout_main.stderr.strip()}")
+                print("    Skipping upstream sync.")
             else:
-                print("  ⚠ Could not auto-merge main into stable.")
-                print("    Resolve conflicts manually, then commit.")
+                _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
+                checkout_back = subprocess.run(
+                    git_cmd + ["checkout", saved_branch],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if checkout_back.returncode != 0:
+                    print(f"  ⚠ Failed to checkout back to {saved_branch}: {checkout_back.stderr.strip()}")
+                    print("    You may need to manually switch branches.")
+                else:
+                    # Merge updated main into stable
+                    merge_result = subprocess.run(
+                        git_cmd + ["merge", "main", "--no-edit"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if merge_result.returncode == 0:
+                        print("  ✓ Merged upstream updates into stable")
+                    else:
+                        print("  ⚠ Could not auto-merge main into stable.")
+                        print("    Run `git merge --abort` to cancel, or resolve conflicts and commit.")
 
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra
         # breaks on this machine, keep base deps and reinstall the remaining extras
