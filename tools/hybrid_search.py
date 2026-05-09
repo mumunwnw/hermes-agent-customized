@@ -1187,6 +1187,27 @@ class HybridSessionSearch:
             else:
                 indexed = 0
             
+            role_breakdown = {}
+            try:
+                role_rows = conn.execute(
+                    "SELECT role, COUNT(*) as cnt FROM messages WHERE content IS NOT NULL GROUP BY role"
+                ).fetchall()
+                for row in role_rows:
+                    role_breakdown[row[0]] = row[1]
+            except Exception:
+                pass
+            
+            indexed_by_role = {}
+            if vec_exists:
+                try:
+                    idx_role_rows = conn.execute(
+                        "SELECT m.role, COUNT(*) as cnt FROM message_vec v JOIN messages m ON v.message_id = m.id GROUP BY m.role"
+                    ).fetchall()
+                    for row in idx_role_rows:
+                        indexed_by_role[row[0]] = row[1]
+                except Exception:
+                    pass
+            
             return {
                 "total_indexable": total,
                 "indexed": indexed,
@@ -1196,6 +1217,8 @@ class HybridSessionSearch:
                 "failed_count": self.indexer.failed_count,
                 "vec_available": self.vec_available,
                 "index_roles": self.index_roles,
+                "role_breakdown": role_breakdown,
+                "indexed_by_role": indexed_by_role,
                 "min_content_length": self.min_content_length,
                 "batch_token_limit": self.batch_token_limit,
                 "idle_index_interval": self._idle_index_interval,
