@@ -220,6 +220,9 @@ class EmbeddingIndexer:
                 vec_path = sqlite_vec.loadable_path()
                 if callable(vec_path):
                     vec_path = vec_path()
+                import sys
+                if sys.platform == "darwin" and not str(vec_path).endswith(".dylib"):
+                    vec_path = str(vec_path) + ".dylib"
                 conn.load_extension(str(vec_path))
                 try:
                     conn.enable_load_extension(False)
@@ -588,7 +591,12 @@ class HybridSessionSearch:
                 new_conn.execute("PRAGMA foreign_keys=ON")
                 
                 with self._db_lock:
+                    old_conn = self.db._conn
                     self.db._conn = new_conn
+                try:
+                    old_conn.close()
+                except Exception:
+                    pass
                 logger.debug("sqlite-vec loaded via pysqlite3 connection swap")
                 return True
             except Exception:
@@ -624,9 +632,11 @@ class HybridSessionSearch:
                            bm25(messages_fts) as rank
                     FROM messages_fts f
                     JOIN messages m ON m.id = f.rowid
+                    JOIN sessions s ON m.session_id = s.id
                     WHERE messages_fts MATCH ?
                     {role_clause}
                     {min_len_clause}
+                    AND (s.source IS NULL OR s.source NOT IN ('tool'))
                     ORDER BY rank
                     LIMIT ?""",
                 [query] + role_params + min_len_params + [limit]
@@ -651,41 +661,11 @@ class HybridSessionSearch:
             return []
     
     def _ensure_vec_loaded(self):
-        """确保主连接已加载 sqlite-vec 扩展。"""
-        try:
-            self.db._conn.execute("SELECT vec_version()").fetchone()
-            return True
-        except Exception:
-            pass
-        try:
-            import sqlite_vec
-            try:
-                self.db._conn.enable_load_extension(True)
-            except AttributeError:
-                pass
-            try:
-                sqlite_vec.load(self.db._conn)
-                try:
-                    self.db._conn.enable_load_extension(False)
-                except AttributeError:
-                    pass
-                return True
-            except Exception:
-                pass
-            try:
-                vec_path = sqlite_vec.loadable_path()
-                if callable(vec_path):
-                    vec_path = vec_path()
-                self.db._conn.load_extension(str(vec_path))
-                try:
-                    self.db._conn.enable_load_extension(False)
-                except AttributeError:
-                    pass
-                return True
-            except Exception:
-                pass
-        except ImportError:
-            pass
+        """DEPRECATED: Use _thread_safe_conn() instead.
+        
+        This method operates on self.db._conn which is not thread-safe.
+        Kept only for backward compatibility — do not call from new code.
+        """
         return False
 
     def _vector_search(self, query: str, limit: int = 50) -> List[Dict[str, Any]]:
@@ -899,6 +879,10 @@ class HybridSessionSearch:
         if cached is not None:
             try:
                 cached.execute("SELECT 1").fetchone()
+                if self.vec_available:
+                    cached.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='message_vec'"
+                    ).fetchone()
                 return cached
             except Exception:
                 try:
@@ -1228,7 +1212,6 @@ class HybridSessionSearch:
             return {"error": "indexing already in progress, cannot rebuild now"}
         
         try:
-            import sqlite3
             db_path = getattr(self.db, 'db_path', None) or getattr(self.db, '_db_path', None)
             if not db_path:
                 try:
@@ -1239,7 +1222,14 @@ class HybridSessionSearch:
             if not db_path:
                 return {"error": "Cannot determine db path for rebuild"}
             
-            write_conn = sqlite3.connect(db_path)
+            write_conn = None
+            try:
+                from pysqlite3 import dbapi2 as pysqlite
+                write_conn = pysqlite.connect(db_path, check_same_thread=False)
+            except ImportError:
+                import sqlite3
+                write_conn = sqlite3.connect(db_path)
+            
             try:
                 write_conn.execute("DROP TABLE IF EXISTS message_vec")
                 write_conn.commit()
