@@ -917,12 +917,10 @@ class HybridSessionSearch:
                     min_len_params + role_params + limit_params
                 ).fetchall()
             
-            return [(
-                _row_get(row, "id"),
-                _row_get(row, "content"),
-                _row_get(row, "session_id"),
-                _row_get(row, "token_count"),
-            ) for row in rows]
+            return [
+                (row[0], row[1], row[2], row[3])
+                for row in rows
+            ]
         except Exception as e:
             logger.warning("Failed to fetch unindexed messages: %s", e)
             return []
@@ -952,7 +950,7 @@ class HybridSessionSearch:
                     min_len_params + role_params
                 ).fetchone()
             
-            return _row_get(row, "cnt", 0)
+            return row[0] if row else 0
         except Exception:
             return 0
     
@@ -961,7 +959,7 @@ class HybridSessionSearch:
             row = self.db._conn.execute(
                 "SELECT MAX(timestamp) as ts FROM messages"
             ).fetchone()
-            ts = _row_get(row, "ts")
+            ts = row[0] if row else None
             if ts is None:
                 return 0.0
             if isinstance(ts, (int, float)):
@@ -1055,19 +1053,23 @@ class HybridSessionSearch:
         try:
             role_clause, role_params = self._role_filter_sql("m")
             min_len_clause, min_len_params = self._min_length_sql("m")
-            total = self.db._conn.execute(
+            total_row = self.db._conn.execute(
                 f"SELECT COUNT(*) as cnt FROM messages m WHERE m.content IS NOT NULL {min_len_clause} {role_clause}",
                 min_len_params + role_params
-            ).fetchone()["cnt"]
+            ).fetchone()
+            total = (total_row["cnt"] if hasattr(total_row, "__contains__") and "cnt" in total_row
+                     else total_row[0]) if total_row else 0
             
             vec_exists = self.db._conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='message_vec'"
             ).fetchone()
             
             if vec_exists:
-                indexed = self.db._conn.execute(
+                idx_row = self.db._conn.execute(
                     "SELECT COUNT(*) as cnt FROM message_vec"
-                ).fetchone()["cnt"]
+                ).fetchone()
+                indexed = (idx_row["cnt"] if hasattr(idx_row, "__contains__") and "cnt" in idx_row
+                           else idx_row[0]) if idx_row else 0
             else:
                 indexed = 0
             
