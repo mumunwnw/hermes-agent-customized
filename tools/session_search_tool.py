@@ -560,49 +560,52 @@ def session_search(
         except (json.JSONDecodeError, TypeError):
             pass
 
-        parts = [f"session_search query={query!r} engine={_search_engine} count={_search_result_count}"]
         if _search_error:
-            parts.append(f"error={_search_error}")
+            logging.info(
+                "🔍 session_search | query=%r | engine=%s | FAILED | error=%s | %.1fs",
+                query, _search_engine, _search_error, elapsed
+            )
+        else:
+            diag = {}
+            try:
+                diag = parsed.get("diagnostics", {}) or {}
+            except Exception:
+                pass
 
-        try:
-            diag = parsed.get("diagnostics", {})
-            if diag:
-                bm25_hits = diag.get("bm25_hits")
-                vec_hits = diag.get("vector_hits")
-                vec_before = diag.get("vec_before_threshold")
-                vec_thresh = diag.get("vec_distance_threshold")
-                fused_before = diag.get("fused_before_rrf_threshold")
-                fused_after = diag.get("fused_after_rrf_threshold")
-                rrf_thresh = diag.get("rrf_score_threshold")
-                if bm25_hits is not None:
-                    parts.append(f"bm25={bm25_hits}")
-                if vec_before is not None:
-                    parts.append(f"vec_raw={vec_before}")
-                if vec_hits is not None:
-                    parts.append(f"vec_filtered={vec_hits}")
-                if vec_thresh is not None:
-                    parts.append(f"vec_thresh={vec_thresh}")
-                if fused_before is not None:
-                    parts.append(f"fused_before={fused_before}")
-                if fused_after is not None:
-                    parts.append(f"fused_after={fused_after}")
-                if rrf_thresh is not None and rrf_thresh > 0:
-                    parts.append(f"rrf_thresh={rrf_thresh}")
-        except Exception:
-            pass
+            if _search_engine == "hybrid" and diag:
+                bm25 = diag.get("bm25_hits", 0)
+                vec_raw = diag.get("vec_before_threshold", 0)
+                vec_filtered = diag.get("vector_hits", 0)
+                vec_thresh = diag.get("vec_distance_threshold", 0)
+                fused_before = diag.get("fused_before_rrf_threshold", 0)
+                fused_after = diag.get("fused_after_rrf_threshold", 0)
+                rrf_thresh = diag.get("rrf_score_threshold", 0)
+                
+                pipeline = f"bm25={bm25} → vec_raw={vec_raw}"
+                if vec_raw != vec_filtered:
+                    pipeline += f" → vec_filtered={vec_filtered}(thresh={vec_thresh})"
+                pipeline += f" → fused={fused_before}"
+                if rrf_thresh > 0:
+                    pipeline += f" → rrf_filtered={fused_after}(thresh={rrf_thresh})"
+                pipeline += f" → result={_search_result_count}"
+                
+                logging.info(
+                    "🔍 session_search | query=%r | hybrid | %s | %.1fs",
+                    query, pipeline, elapsed
+                )
+            elif _search_engine == "bm25" and diag:
+                bm25 = diag.get("bm25_hits", 0)
+                sessions = diag.get("sessions_after_dedup", 0)
+                logging.info(
+                    "🔍 session_search | query=%r | bm25 | hits=%d → dedup=%d → result=%d | %.1fs",
+                    query, bm25, sessions, _search_result_count, elapsed
+                )
+            else:
+                logging.info(
+                    "🔍 session_search | query=%r | engine=%s | result=%d | %.1fs",
+                    query, _search_engine, _search_result_count, elapsed
+                )
 
-        results_list = parsed.get("results", [])
-        if results_list and isinstance(results_list, list):
-            summary_snippets = []
-            for r in results_list[:3]:
-                s = r.get("summary", "")
-                if s:
-                    summary_snippets.append(s[:80].replace("\n", " "))
-            if summary_snippets:
-                parts.append(f"summaries={summary_snippets}")
-
-        parts.append(f"elapsed={elapsed:.2f}s")
-        logging.info(" ".join(parts))
         return result_str
 
     if db is None:
