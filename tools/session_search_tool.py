@@ -3,7 +3,9 @@
 Session Search Tool - Long-Term Conversation Recall
 
 Searches past session transcripts in SQLite via FTS5, then summarizes the top
-matching sessions using a cheap/fast model (same pattern as web_extract).
+matching sessions using the configured auxiliary session_search model (same
+pattern as web_extract). By default, auxiliary "auto" routing uses the main
+chat provider/model unless the user overrides auxiliary.session_search.
 Returns focused summaries of past conversations rather than raw transcripts,
 keeping the main model's context window clean.
 
@@ -11,7 +13,7 @@ Flow:
   1. FTS5 search finds matching messages ranked by relevance
   2. Groups by session, takes the top N unique sessions (default 3)
   3. Loads each session's conversation, truncates to ~100k chars centered on matches
-  4. Sends to Gemini Flash with a focused summarization prompt
+  4. Sends to the configured auxiliary model with a focused summarization prompt
   5. Returns per-session summaries with metadata
 """
 
@@ -298,11 +300,48 @@ def _try_hybrid_search(
             }, ensure_ascii=False)
         
         # Convert hybrid results to session IDs for summarization
+        # Resolve child sessions to their parent (same as BM25 path)
+        def _resolve_to_parent(session_id: str) -> str:
+            visited = set()
+            sid = session_id
+            while sid and sid not in visited:
+                visited.add(sid)
+                try:
+                    session = db.get_session(sid)
+                    if not session:
+                        break
+                    parent = session.get("parent_session_id")
+                    if parent:
+                        sid = parent
+                    else:
+                        break
+                except Exception:
+                    break
+            return sid
+
+        current_lineage_root = (
+            _resolve_to_parent(current_session_id) if current_session_id else None
+        )
+
         session_ids = []
         for result in hybrid_results:
             sid = result.get("session_id", "")
-            if sid and sid != current_session_id:
-                session_ids.append((sid, result.get("rrf_score", 0.0), result))
+            if not sid:
+                continue
+            resolved_sid = _resolve_to_parent(sid)
+            if current_lineage_root and resolved_sid == current_lineage_root:
+                continue
+            if current_session_id and sid == current_session_id:
+                continue
+            # Filter hidden sources
+            try:
+                session_meta = db.get_session(resolved_sid) or {}
+                source = session_meta.get("source", "")
+                if source in _HIDDEN_SESSION_SOURCES:
+                    continue
+            except Exception:
+                pass
+            session_ids.append((resolved_sid, result.get("rrf_score", 0.0), result))
         
         # Deduplicate and limit
         seen = set()
@@ -313,6 +352,16 @@ def _try_hybrid_search(
                 unique_sessions.append((sid, hybrid_meta))
             if len(unique_sessions) >= limit:
                 break
+        
+        if not unique_sessions:
+            return json.dumps({
+                "success": True,
+                "query": query,
+                "engine": "hybrid",
+                "results": [],
+                "count": 0,
+                "message": "No matching sessions found (hybrid).",
+            }, ensure_ascii=False)
         
         # Summarize sessions
         return _summarize_hybrid_sessions(unique_sessions, query, db)
@@ -367,7 +416,7 @@ def _summarize_hybrid_sessions(
     
     summaries = []
     first_diagnostics = None
-    for (session_id, match_info, conversation_text, _), result in zip(tasks, results):
+    for (session_id, match_info, conversation_text, session_meta), result in zip(tasks, results):
         if isinstance(result, Exception):
             logging.warning("Failed to summarize session %s: %s", session_id, result, exc_info=True)
             result = None
@@ -379,9 +428,11 @@ def _summarize_hybrid_sessions(
         
         entry = {
             "session_id": session_id,
-            "when": _format_timestamp(match_info.get("session_started")),
-            "source": match_info.get("source", "unknown"),
-            "model": match_info.get("model"),
+            "when": _format_timestamp(
+                session_meta.get("started_at") or match_info.get("session_started")
+            ),
+            "source": session_meta.get("source") or match_info.get("source", "unknown"),
+            "model": session_meta.get("model") or match_info.get("model"),
             "hybrid_score": match_info.get("rrf_score", 0.0),
         }
         
@@ -473,9 +524,17 @@ def session_search(
     """
     Search past sessions and return focused summaries of matching conversations.
 
-    Uses FTS5 to find matches, then summarizes the top sessions with Gemini Flash.
+    Uses FTS5 to find matches, then summarizes the top sessions with the
+    configured auxiliary session_search model.
     The current session is excluded from results since the agent already has that context.
     """
+    if db is None:
+        from hermes_state import format_session_db_unavailable
+        return tool_error(format_session_db_unavailable(), success=False)
+
+    # Defensive: models (especially open-source) may send non-int limit values
+    # (None when JSON null, string "int", or even a type object).  Coerce to a
+    # safe integer before any arithmetic/comparison to prevent TypeError.
     if not isinstance(limit, int):
         try:
             limit = int(limit)
@@ -719,7 +778,7 @@ def session_search(
             }, ensure_ascii=False))
 
         summaries = []
-        for (session_id, match_info, conversation_text, _), result in zip(tasks, results):
+        for (session_id, match_info, conversation_text, session_meta), result in zip(tasks, results):
             if isinstance(result, Exception):
                 logging.warning(
                     "Failed to summarize session %s: %s",
@@ -727,11 +786,18 @@ def session_search(
                 )
                 result = None
 
+            # Prefer resolved parent session metadata over FTS5 match metadata.
+            # match_info carries source/model from the *child* session that contained
+            # the FTS5 hit; after _resolve_to_parent() the session_id points to the
+            # root, so session_meta has the authoritative platform/source for the
+            # session the user actually cares about (#15909).
             entry = {
                 "session_id": session_id,
-                "when": _format_timestamp(match_info.get("session_started")),
-                "source": match_info.get("source", "unknown"),
-                "model": match_info.get("model"),
+                "when": _format_timestamp(
+                    session_meta.get("started_at") or match_info.get("session_started")
+                ),
+                "source": session_meta.get("source") or match_info.get("source", "unknown"),
+                "model": session_meta.get("model") or match_info.get("model"),
             }
 
             if result:
@@ -957,7 +1023,10 @@ def index_unindexed_messages(db=None) -> str:
         config = {}
     hybrid = get_hybrid_search(db, config=config)
     result = hybrid._index_unindexed_batch()
-    result["success"] = True
+    if "error" in result:
+        result["success"] = False
+    else:
+        result["success"] = True
     return json.dumps(result, ensure_ascii=False)
 
 

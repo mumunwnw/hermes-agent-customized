@@ -105,11 +105,11 @@ class TestVecDistanceThreshold:
         search._ensure_vec_loaded = MagicMock(return_value=True)
         search._call_embedding_api = MagicMock(return_value=[0.1] * 1024)
 
-        mock_row_1 = OrderedDict([("id", 1), ("session_id", "s1"), ("content", "a"), ("role", "user"), ("timestamp", 1.0), ("distance", 0.8)])
-        mock_row_2 = OrderedDict([("id", 2), ("session_id", "s2"), ("content", "b"), ("role", "user"), ("timestamp", 2.0), ("distance", 1.5)])
+        mock_row_1 = (1, "s1", "a", "user", 1.0, 0.8)
+        mock_row_2 = (2, "s2", "b", "user", 2.0, 1.5)
 
         search.db._conn.execute.return_value.fetchall.return_value = [mock_row_1, mock_row_2]
-        search.db._conn.execute.return_value.fetchone.return_value = OrderedDict([("name", "message_vec")])
+        search.db._conn.execute.return_value.fetchone.return_value = ("message_vec",)
 
         with patch("tools.hybrid_search._vec_serialize", return_value=b"\x00" * 4096):
             results = search._vector_search("test", limit=50)
@@ -331,17 +331,18 @@ class TestMinContentLength:
     def test_zero_means_no_filter(self):
         search = _make_search()
         assert search.min_content_length == 0
-        assert search._min_length_sql() == ""
+        assert search._min_length_sql() == ("", [])
 
     def test_zero_explicit_no_filter(self):
         search = _make_search(config={"hybrid": {"min_content_length": 0}})
         assert search.min_content_length == 0
-        assert search._min_length_sql() == ""
+        assert search._min_length_sql() == ("", [])
 
     def test_positive_value_generates_clause(self):
         search = _make_search(config={"hybrid": {"min_content_length": 100}})
-        clause = search._min_length_sql()
-        assert "LENGTH(m.content) >= 100" in clause
+        clause, params = search._min_length_sql()
+        assert "LENGTH(m.content) >= ?" in clause
+        assert params == [100]
 
     def test_index_status_includes_min_content_length(self):
         search = _make_search(config={"hybrid": {"min_content_length": 30}})

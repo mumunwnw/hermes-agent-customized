@@ -18,10 +18,17 @@ def _on_session_finalize(session_id: str = None, platform: str = "", **_: Any) -
     except Exception:
         return
     try:
-        from tools.hybrid_search import get_hybrid_search
+        from tools.hybrid_search import get_hybrid_search, check_hybrid_search_requirements
+        if not check_hybrid_search_requirements():
+            return
+        # Reuse existing singleton if available — avoid opening a new SessionDB
+        from tools.hybrid_search import _hybrid_instance
+        if _hybrid_instance is not None:
+            _hybrid_instance.index_session()
+            return
+        # No singleton yet — create one (this opens a DB connection)
         from hermes_state import SessionDB
         from hermes_constants import get_hermes_home
-
         db_path = get_hermes_home() / "state.db"
         db = SessionDB(db_path)
         search = get_hybrid_search(db, config=ss_config)

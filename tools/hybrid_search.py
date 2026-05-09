@@ -90,11 +90,18 @@ def _parse_interval(value) -> int:
     return max(5, int(total))
 
 
-def _vec_serialize(vector: List[float]) -> bytes:
-    """Serialize float vector for sqlite-vec. Handles API name differences."""
-    import sqlite_vec
-    fn = getattr(sqlite_vec, 'serialize_float32', None) or sqlite_vec.serialize_f32
-    return fn(vector)
+def _vec_serialize(vector: List[float]) -> Optional[bytes]:
+    """Serialize float vector for sqlite-vec. Handles API name differences.
+    Returns None if serialization fails (e.g. vector contains None)."""
+    if vector is None:
+        return None
+    try:
+        import sqlite_vec
+        fn = getattr(sqlite_vec, 'serialize_float32', None) or sqlite_vec.serialize_f32
+        return fn(vector)
+    except (TypeError, AttributeError, ValueError) as e:
+        logger.warning("Failed to serialize vector: %s", e)
+        return None
 
 
 def _check_sqlite_vec_available() -> bool:
@@ -106,27 +113,71 @@ def _check_sqlite_vec_available() -> bool:
         return False
 
 
+def _detect_embedding_dim(api_url: str, model: str, api_key: str) -> int:
+    """Probe embedding API to detect output dimension by sending a test string."""
+    if not api_key:
+        return 1024
+    try:
+        import httpx
+        response = httpx.post(
+            f"{api_url}/embeddings",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={"model": model, "input": "test"},
+            timeout=15,
+        )
+        if response.status_code == 200:
+            data = response.json().get("data", [])
+            if data and "embedding" in data[0]:
+                return len(data[0]["embedding"])
+    except Exception as e:
+        logger.debug("Could not detect embedding dimension: %s", e)
+    return 1024
+
+
 class EmbeddingIndexer:
     """Embedding 索引器 - 批量模式，由守护线程驱动。"""
     
     _MODEL_MAX_TOKENS = 8192
     
     def __init__(self, db, api_url: str, model: str, api_key: str,
-                 min_content_length: int = None, batch_token_limit: int = 7000):
+                 min_content_length: int = None, batch_token_limit: int = 7000,
+                 embedding_dim: int = 1024):
         self.db = db
         self.api_url = api_url
         self.model = model
         self.api_key = api_key
         self.min_content_length = min_content_length
         self.batch_token_limit = batch_token_limit
+        self.embedding_dim = embedding_dim
         
-        self.indexed_count = 0
-        self.failed_count = 0
+        self._count_lock = threading.Lock()
+        self._indexed_count = 0
+        self._failed_count = 0
+    
+    @property
+    def indexed_count(self):
+        with self._count_lock:
+            return self._indexed_count
+    
+    @property
+    def failed_count(self):
+        with self._count_lock:
+            return self._failed_count
+    
+    def _increment_indexed(self, n=1):
+        with self._count_lock:
+            self._indexed_count += n
+    
+    def _increment_failed(self, n=1):
+        with self._count_lock:
+            self._failed_count += n
     
     @staticmethod
     def _estimate_tokens(content: str, token_count: int = None) -> int:
         if token_count is not None and token_count > 0:
             return token_count
+        if not content:
+            return 0
         cjk = sum(1 for ch in content if '\u4e00' <= ch <= '\u9fff' or '\u3040' <= ch <= '\u30ff')
         return int(len(content) + cjk * 0.5)
     
@@ -143,10 +194,11 @@ class EmbeddingIndexer:
             truncated = content[:max(1, char_limit - 100)]
         return truncated
     
-    def index_batch(self, items: list):
+    def index_batch(self, items: list, stop_event: threading.Event = None):
         """批量索引：按 token 分组，每组一次 API 调用 + 一次 DB 写入。
         
         items: [(message_id, content, session_id, token_count), ...]
+        stop_event: if set, abort between batches
         """
         if not items or not self.api_key:
             return
@@ -195,9 +247,9 @@ class EmbeddingIndexer:
             ).fetchone()
             if not vec_exists:
                 conn.execute(
-                    """CREATE VIRTUAL TABLE IF NOT EXISTS message_vec USING vec0(
+                    f"""CREATE VIRTUAL TABLE IF NOT EXISTS message_vec USING vec0(
                         message_id INTEGER PRIMARY KEY,
-                        embedding FLOAT[1024],
+                        embedding FLOAT[{self.embedding_dim}],
                         session_id TEXT
                     )"""
                 )
@@ -206,6 +258,10 @@ class EmbeddingIndexer:
             batches = self._group_into_batches(items)
             
             for batch in batches:
+                if stop_event and stop_event.is_set():
+                    logger.info("Indexing batch aborted by stop event")
+                    break
+                
                 texts = []
                 valid_items = []
                 for msg_id, content, sid, tc in batch:
@@ -219,21 +275,28 @@ class EmbeddingIndexer:
                 
                 embeddings = self._call_embedding_api_batch(texts)
                 if not embeddings or len(embeddings) != len(valid_items):
-                    self.failed_count += len(valid_items)
+                    self._increment_failed(len(valid_items))
                     continue
                 
                 for (msg_id, sid), emb in zip(valid_items, embeddings):
+                    if emb is None:
+                        self._increment_failed()
+                        continue
+                    serialized = _vec_serialize(emb)
+                    if serialized is None:
+                        self._increment_failed()
+                        continue
                     try:
                         conn.execute(
                             """INSERT OR REPLACE INTO message_vec 
                                (message_id, embedding, session_id) 
                                VALUES (?, ?, ?)""",
-                            (msg_id, _vec_serialize(emb), sid)
+                            (msg_id, serialized, sid)
                         )
-                        self.indexed_count += 1
+                        self._increment_indexed()
                     except Exception as e:
                         logger.warning("Failed to insert embedding for %d: %s", msg_id, e)
-                        self.failed_count += 1
+                        self._increment_failed()
                 
                 conn.commit()
         finally:
@@ -267,7 +330,7 @@ class EmbeddingIndexer:
         return batches
     
     def _call_embedding_api_batch(self, texts: list, max_retries: int = 3) -> Optional[list]:
-        """批量调用 embedding API。"""
+        """批量调用 embedding API。Returns list of embeddings or None."""
         if not self.api_key or not texts:
             return None
         
@@ -297,9 +360,23 @@ class EmbeddingIndexer:
                     return self._fallback_single_calls(texts)
                 
                 response.raise_for_status()
-                data = response.json()["data"]
-                data.sort(key=lambda x: x["index"])
-                return [d["embedding"] for d in data]
+                data = response.json().get("data", [])
+                if not data or len(data) != len(texts):
+                    logger.warning("Embedding API returned %d results for %d inputs",
+                                   len(data), len(texts))
+                    return self._fallback_single_calls(texts)
+                try:
+                    data.sort(key=lambda x: x.get("index", 0))
+                except (KeyError, TypeError):
+                    pass
+                embeddings = []
+                for d in data:
+                    emb = d.get("embedding")
+                    if emb is None:
+                        embeddings.append(None)
+                    else:
+                        embeddings.append(emb)
+                return embeddings
             
             except httpx.TimeoutException:
                 logger.warning("Embedding API timeout (batch attempt %d/%d)", attempt + 1, max_retries)
@@ -314,7 +391,7 @@ class EmbeddingIndexer:
         return None
     
     def _fallback_single_calls(self, texts: list) -> list:
-        """批量失败时回退到逐条调用。"""
+        """批量失败时回退到逐条调用。None for failed items."""
         results = []
         for text in texts:
             emb = self._call_embedding_api_with_retry(text)
@@ -355,7 +432,10 @@ class EmbeddingIndexer:
                     return None
                 
                 response.raise_for_status()
-                return response.json()["data"][0]["embedding"]
+                data = response.json().get("data", [])
+                if data and "embedding" in data[0]:
+                    return data[0]["embedding"]
+                return None
             
             except httpx.TimeoutException:
                 logger.warning("Embedding API timeout (attempt %d/%d)", attempt + 1, max_retries)
@@ -375,6 +455,7 @@ class HybridSessionSearch:
     def __init__(self, db, config: Dict[str, Any] = None):
         self.db = db
         self.config = config or {}
+        self._db_lock = getattr(db, '_lock', None) or threading.Lock()
         
         hybrid_config = self.config.get("hybrid", {})
         
@@ -415,6 +496,13 @@ class HybridSessionSearch:
         self._stop_event = threading.Event()
         self._last_index_time = 0.0
         
+        # Detect embedding dimension from config or probe API
+        self.embedding_dim = hybrid_config.get("embed_dim", 0)
+        if not self.embedding_dim or self.embedding_dim <= 0:
+            self.embedding_dim = _detect_embedding_dim(
+                self.embedding_api_url, self.embedding_model, self.api_key
+            )
+        
         # 检查 sqlite-vec 可用性并加载扩展
         self.vec_available = self._load_vec_extension()
         if not self.vec_available:
@@ -425,6 +513,7 @@ class HybridSessionSearch:
             db, self.embedding_api_url, self.embedding_model, self.api_key,
             min_content_length=self.min_content_length,
             batch_token_limit=self.batch_token_limit,
+            embedding_dim=self.embedding_dim,
         )
         
 
@@ -435,10 +524,10 @@ class HybridSessionSearch:
             list(self.index_roles),
         )
 
-    def _min_length_sql(self, table_alias: str = "m") -> str:
+    def _min_length_sql(self, table_alias: str = "m") -> tuple:
         if self.min_content_length and self.min_content_length > 0:
-            return f"AND LENGTH({table_alias}.content) >= {self.min_content_length} "
-        return ""
+            return (f"AND LENGTH({table_alias}.content) >= ? ", [self.min_content_length])
+        return ("", [])
     
     def _load_vec_extension(self) -> bool:
         """尝试加载 sqlite-vec 扩展到数据库连接。"""
@@ -487,6 +576,10 @@ class HybridSessionSearch:
                 pass
             
             # 方法 3: 替换连接为 pysqlite3 — macOS 最后手段
+            # WARNING: This replaces self.db._conn which other threads may be using.
+            # We hold _db_lock to minimize the race window, but callers should
+            # ensure no other DB operations are in flight when HybridSessionSearch
+            # is first constructed.
             try:
                 from pysqlite3 import dbapi2 as pysqlite
                 db_path = None
@@ -497,13 +590,20 @@ class HybridSessionSearch:
                 except Exception:
                     pass
                 
-                new_conn = pysqlite.connect(db_path or ":memory:")
+                if not db_path:
+                    logger.warning("Cannot determine db_path for pysqlite3 connection swap, skipping")
+                    return False
+                
+                new_conn = pysqlite.connect(db_path)
                 new_conn.enable_load_extension(True)
                 sqlite_vec.load(new_conn)
                 new_conn.enable_load_extension(False)
                 new_conn.row_factory = pysqlite.Row
+                new_conn.execute("PRAGMA journal_mode=WAL")
+                new_conn.execute("PRAGMA foreign_keys=ON")
                 
-                self.db._conn = new_conn
+                with self._db_lock:
+                    self.db._conn = new_conn
                 logger.debug("sqlite-vec loaded via pysqlite3 connection swap")
                 return True
             except Exception:
@@ -522,11 +622,11 @@ class HybridSessionSearch:
     def _bm25_search(self, query: str, limit: int = 50) -> List[Dict[str, Any]]:
         """BM25 关键词搜索（使用 FTS5）。"""
         try:
-            # 使用现有的 FTS5 搜索
             results = self.db.search_messages(
                 query,
                 limit=limit,
                 offset=0,
+                role_filter=list(self.index_roles) if self.index_roles else None,
             )
             
             # 转换为标准格式
@@ -597,6 +697,11 @@ class HybridSessionSearch:
         if not query_embedding:
             return []
         
+        query_vec = _vec_serialize(query_embedding)
+        if query_vec is None:
+            logger.warning("Failed to serialize query embedding for vector search")
+            return []
+        
         try:
             import sqlite_vec
             
@@ -609,29 +714,32 @@ class HybridSessionSearch:
             
             top_k = min(self.vec_top_k, limit)
             
+            role_clause, role_params = self._role_filter_sql()
+            
             results = self.db._conn.execute(
-                """SELECT m.id, m.session_id, m.content, m.role, m.timestamp,
+                f"""SELECT m.id, m.session_id, m.content, m.role, m.timestamp,
                           distance
                    FROM message_vec
                    JOIN messages m ON m.id = message_vec.message_id
                    WHERE embedding MATCH ?
                      AND k = ?
+                     {role_clause}
                    ORDER BY distance""",
-                (_vec_serialize(query_embedding), top_k)
+                [query_vec, top_k] + role_params
             ).fetchall()
             
             formatted = []
             for r in results:
-                distance = _row_get(r, "distance")
+                distance = r[5]
                 if distance is None:
                     continue
-                content = _row_get(r, "content") or ""
+                content = r[2] or ""
                 formatted.append({
-                    "message_id": _row_get(r, "id"),
-                    "session_id": _row_get(r, "session_id"),
+                    "message_id": r[0],
+                    "session_id": r[1],
                     "content": content,
-                    "role": _row_get(r, "role"),
-                    "timestamp": _row_get(r, "timestamp"),
+                    "role": r[3],
+                    "timestamp": r[4],
                     "snippet": content[:200] + "...",
                     "vector_distance": distance,
                 })
@@ -647,7 +755,11 @@ class HybridSessionSearch:
         vector_results: List[Dict[str, Any]],
         limit: int = 20,
     ) -> List[Dict[str, Any]]:
-        """RRF 融合 - 合并 BM25 和 Vector 结果。"""
+        """RRF 融合 - 合并 BM25 和 Vector 结果。
+        
+        When a message appears in both result sets, we merge metadata
+        from both sources rather than letting one overwrite the other.
+        """
         from collections import defaultdict
         
         scores = defaultdict(float)
@@ -657,18 +769,30 @@ class HybridSessionSearch:
         for rank, result in enumerate(bm25_results, 1):
             msg_id = result["message_id"]
             scores[msg_id] += 1.0 / (self.rrf_k + rank)
-            result_map[msg_id] = result
+            if msg_id not in result_map:
+                result_map[msg_id] = result.copy()
+            else:
+                result_map[msg_id].update({
+                    k: v for k, v in result.items()
+                    if k not in ("vector_distance", "rrf_score")
+                })
         
-        # Vector 排名贡献
+        # Vector 排名贡献 — merge rather than overwrite
         for rank, result in enumerate(vector_results, 1):
             msg_id = result["message_id"]
             scores[msg_id] += 1.0 / (self.rrf_k + rank)
-            result_map[msg_id] = result
+            if msg_id not in result_map:
+                result_map[msg_id] = result.copy()
+            else:
+                # Preserve BM25 snippet (usually higher quality) and add vector_distance
+                result_map[msg_id]["vector_distance"] = result.get("vector_distance")
+                if "snippet" not in result_map[msg_id] or not result_map[msg_id]["snippet"]:
+                    result_map[msg_id]["snippet"] = result.get("snippet", "")
         
         # 按融合分数排序
         fused = []
         for msg_id, score in sorted(scores.items(), key=lambda x: x[1], reverse=True)[:limit]:
-            result = result_map[msg_id].copy()
+            result = result_map[msg_id]
             result["rrf_score"] = score
             fused.append(result)
         
@@ -727,7 +851,7 @@ class HybridSessionSearch:
             # 准备文档
             documents = [
                 f"[{c['role']}] {c.get('snippet', c.get('content', ''))[:500]}"
-                for c in candidates[:20]  # 只 rerank top 20
+                for c in candidates[:20]
             ]
             
             # 调用 reranker API
@@ -747,6 +871,9 @@ class HybridSessionSearch:
             reranked = []
             for hit in response.json()["results"]:
                 idx = hit["index"]
+                if idx < 0 or idx >= len(candidates):
+                    logger.warning("Reranker returned out-of-range index %d (candidates=%d)", idx, len(candidates))
+                    continue
                 result = candidates[idx].copy()
                 result["rerank_score"] = hit["relevance_score"]
                 reranked.append(result)
@@ -762,7 +889,7 @@ class HybridSessionSearch:
         
         self._ensure_vec_loaded()
         role_clause, role_params = self._role_filter_sql()
-        min_len_clause = self._min_length_sql()
+        min_len_clause, min_len_params = self._min_length_sql()
         limit_clause = f"LIMIT ? " if limit else ""
         limit_params = [limit] if limit else []
         
@@ -777,7 +904,7 @@ class HybridSessionSearch:
                        WHERE m.content IS NOT NULL {min_len_clause}
                        {role_clause}
                        ORDER BY m.timestamp DESC {limit_clause}""",
-                    role_params + limit_params
+                    min_len_params + role_params + limit_params
                 ).fetchall()
             else:
                 rows = self.db._conn.execute(
@@ -787,15 +914,13 @@ class HybridSessionSearch:
                          AND m.content IS NOT NULL {min_len_clause}
                        {role_clause}
                        ORDER BY m.timestamp DESC {limit_clause}""",
-                    role_params + limit_params
+                    min_len_params + role_params + limit_params
                 ).fetchall()
             
-            return [(
-                _row_get(row, "id"),
-                _row_get(row, "content"),
-                _row_get(row, "session_id"),
-                _row_get(row, "token_count"),
-            ) for row in rows]
+            return [
+                (row[0], row[1], row[2], row[3])
+                for row in rows
+            ]
         except Exception as e:
             logger.warning("Failed to fetch unindexed messages: %s", e)
             return []
@@ -804,9 +929,12 @@ class HybridSessionSearch:
         if not self.vec_available or not self.api_key:
             return 0
         
+        if not self._ensure_vec_loaded():
+            return 0
+        
         try:
             role_clause, role_params = self._role_filter_sql("m")
-            min_len_clause = self._min_length_sql("m")
+            min_len_clause, min_len_params = self._min_length_sql("m")
             vec_exists = self.db._conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='message_vec'"
             ).fetchone()
@@ -814,7 +942,7 @@ class HybridSessionSearch:
             if not vec_exists:
                 row = self.db._conn.execute(
                     f"SELECT COUNT(*) as cnt FROM messages m WHERE m.content IS NOT NULL {min_len_clause} {role_clause}",
-                    role_params
+                    min_len_params + role_params
                 ).fetchone()
             else:
                 row = self.db._conn.execute(
@@ -822,10 +950,10 @@ class HybridSessionSearch:
                        LEFT JOIN message_vec v ON m.id = v.message_id
                        WHERE v.message_id IS NULL
                          AND m.content IS NOT NULL {min_len_clause} {role_clause}""",
-                    role_params
+                    min_len_params + role_params
                 ).fetchone()
             
-            return _row_get(row, "cnt", 0)
+            return row[0] if row else 0
         except Exception:
             return 0
     
@@ -834,7 +962,7 @@ class HybridSessionSearch:
             row = self.db._conn.execute(
                 "SELECT MAX(timestamp) as ts FROM messages"
             ).fetchone()
-            ts = _row_get(row, "ts")
+            ts = row[0] if row else None
             if ts is None:
                 return 0.0
             if isinstance(ts, (int, float)):
@@ -858,8 +986,6 @@ class HybridSessionSearch:
                 if self._stop_event.is_set():
                     break
                 try:
-                    if self._indexing_lock.locked():
-                        continue
                     last_msg_time = self._get_last_message_time()
                     if last_msg_time <= 0:
                         continue
@@ -879,8 +1005,11 @@ class HybridSessionSearch:
                     try:
                         items = self._fetch_unindexed(limit=500)
                         if items:
-                            self.indexer.index_batch(items)
-                        self._last_index_time = last_msg_time
+                            before = self.indexer.indexed_count
+                            self.indexer.index_batch(items, stop_event=self._stop_event)
+                            batch_indexed = self.indexer.indexed_count - before
+                            if batch_indexed > 0:
+                                self._last_index_time = last_msg_time
                     finally:
                         self._indexing_lock.release()
                 except Exception as e:
@@ -897,10 +1026,10 @@ class HybridSessionSearch:
         if not self.vec_available or not self.api_key:
             return {"error": "hybrid search not available (sqlite-vec or API key missing)"}
         
-        if self._indexing_lock.locked():
+        if not self._indexing_lock.acquire(blocking=False):
             return {"error": "indexing already in progress"}
         
-        with self._indexing_lock:
+        try:
             items = self._fetch_unindexed(limit=limit)
             if not items:
                 return {"indexed": 0, "message": "No unindexed messages found"}
@@ -915,6 +1044,8 @@ class HybridSessionSearch:
                 "failed": self.indexer.failed_count - before_failed,
                 "total_processed": len(items),
             }
+        finally:
+            self._indexing_lock.release()
     
     def index_session(self, session_id: str = None):
         result = self._index_unindexed_batch()
@@ -924,19 +1055,24 @@ class HybridSessionSearch:
     def index_status(self) -> Dict[str, Any]:
         try:
             role_clause, role_params = self._role_filter_sql("m")
-            total = self.db._conn.execute(
-                f"SELECT COUNT(*) as cnt FROM messages m WHERE m.content IS NOT NULL {self._min_length_sql('m')} {role_clause}",
-                role_params
-            ).fetchone()["cnt"]
+            min_len_clause, min_len_params = self._min_length_sql("m")
+            total_row = self.db._conn.execute(
+                f"SELECT COUNT(*) as cnt FROM messages m WHERE m.content IS NOT NULL {min_len_clause} {role_clause}",
+                min_len_params + role_params
+            ).fetchone()
+            total = (total_row["cnt"] if hasattr(total_row, "__contains__") and "cnt" in total_row
+                     else total_row[0]) if total_row else 0
             
             vec_exists = self.db._conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='message_vec'"
             ).fetchone()
             
             if vec_exists:
-                indexed = self.db._conn.execute(
+                idx_row = self.db._conn.execute(
                     "SELECT COUNT(*) as cnt FROM message_vec"
-                ).fetchone()["cnt"]
+                ).fetchone()
+                indexed = (idx_row["cnt"] if hasattr(idx_row, "__contains__") and "cnt" in idx_row
+                           else idx_row[0]) if idx_row else 0
             else:
                 indexed = 0
             
@@ -952,6 +1088,7 @@ class HybridSessionSearch:
                 "min_content_length": self.min_content_length,
                 "batch_token_limit": self.batch_token_limit,
                 "idle_index_interval": self._idle_index_interval,
+                "embedding_dim": self.embedding_dim,
             }
         except Exception as e:
             return {"error": str(e)}
@@ -960,19 +1097,42 @@ class HybridSessionSearch:
         if not self.vec_available or not self.api_key:
             return {"error": "hybrid search not available (sqlite-vec or API key missing)"}
         
-        self._ensure_vec_loaded()
+        if not self._indexing_lock.acquire(blocking=False):
+            return {"error": "indexing already in progress, cannot rebuild now"}
         
         try:
+            self._ensure_vec_loaded()
+            
             self.db._conn.execute("DROP TABLE IF EXISTS message_vec")
             self.db._conn.commit()
             logger.info("Dropped message_vec table for rebuild")
             
-            self._load_vec_extension()
+            self._ensure_vec_loaded()
             
-            return self._index_unindexed_batch()
+            # Inline the indexing logic instead of calling _index_unindexed_batch
+            # which would try to re-acquire _indexing_lock (non-reentrant deadlock)
+            items = self._fetch_unindexed()
+            if not items:
+                return {"indexed": 0, "message": "No messages to index after rebuild"}
+            
+            before_indexed = self.indexer.indexed_count
+            before_failed = self.indexer.failed_count
+            
+            self.indexer.index_batch(items)
+            
+            return {
+                "indexed": self.indexer.indexed_count - before_indexed,
+                "failed": self.indexer.failed_count - before_failed,
+                "total_processed": len(items),
+            }
         except Exception as e:
             logger.error("Rebuild index failed: %s", e, exc_info=True)
             return {"error": str(e)}
+        finally:
+            try:
+                self._indexing_lock.release()
+            except RuntimeError:
+                pass
 
 
 def get_hybrid_search(db, config: dict = None) -> "HybridSessionSearch":
