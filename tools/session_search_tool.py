@@ -265,6 +265,149 @@ async def _summarize_session(
 _HIDDEN_SESSION_SOURCES = ("tool",)
 
 
+def _try_hybrid_search(
+    query: str,
+    limit: int,
+    db,
+    current_session_id: str = None,
+    session_search_config: dict = None,
+) -> Optional[str]:
+    """Try to search using hybrid engine. Returns None if hybrid is unavailable."""
+    try:
+        from tools.hybrid_search import get_hybrid_search, check_hybrid_search_requirements
+        
+        if not check_hybrid_search_requirements():
+            return None
+        
+        hybrid = get_hybrid_search(db, config=session_search_config)
+        
+        # Execute hybrid search
+        hybrid_results = hybrid.search(query, limit=limit * 3)
+        
+        if not hybrid_results:
+            return json.dumps({
+                "success": True,
+                "query": query,
+                "engine": "hybrid",
+                "results": [],
+                "count": 0,
+                "message": "No matching sessions found (hybrid).",
+                "diagnostics": {
+                    "engine": "hybrid",
+                    "vec_available": hybrid.vec_available,
+                    "has_api_key": bool(hybrid.api_key),
+                },
+            }, ensure_ascii=False)
+        
+        # Convert hybrid results to session IDs for summarization
+        session_ids = []
+        for result in hybrid_results:
+            sid = result.get("session_id", "")
+            if sid and sid != current_session_id:
+                session_ids.append((sid, result.get("rrf_score", 0.0), result))
+        
+        # Deduplicate and limit
+        seen = set()
+        unique_sessions = []
+        for sid, score, hybrid_meta in session_ids:
+            if sid not in seen:
+                seen.add(sid)
+                unique_sessions.append((sid, hybrid_meta))
+            if len(unique_sessions) >= limit:
+                break
+        
+        # Summarize sessions
+        return _summarize_hybrid_sessions(unique_sessions, query, db)
+        
+    except Exception as e:
+        logging.warning("Hybrid search failed: %s", e, exc_info=True)
+        return None
+
+
+def _summarize_hybrid_sessions(
+    unique_sessions: List[tuple],
+    query: str,
+    db,
+) -> str:
+    """Summarize sessions found by hybrid search."""
+    tasks = []
+    for session_id, hybrid_meta in unique_sessions:
+        try:
+            messages = db.get_messages_as_conversation(session_id)
+            if not messages:
+                continue
+            session_meta = db.get_session(session_id) or {}
+            conversation_text = _format_conversation(messages)
+            conversation_text = _truncate_around_matches(conversation_text, query)
+            tasks.append((session_id, hybrid_meta, conversation_text, session_meta))
+        except Exception as e:
+            logging.warning("Failed to prepare session %s: %s", session_id, e, exc_info=True)
+    
+    async def _summarize_all() -> List[Union[str, Exception]]:
+        max_concurrency = _get_session_search_max_concurrency()
+        semaphore = asyncio.Semaphore(max_concurrency)
+        
+        async def _bounded_summary(text: str, meta: Dict[str, Any]) -> Optional[str]:
+            async with semaphore:
+                return await _summarize_session(text, query, meta)
+        
+        coros = [
+            _bounded_summary(text, meta)
+            for _, _, text, meta in tasks
+        ]
+        return await asyncio.gather(*coros, return_exceptions=True)
+    
+    try:
+        from model_tools import _run_async
+        results = _run_async(_summarize_all())
+    except concurrent.futures.TimeoutError:
+        logging.warning("Session summarization timed out after 60 seconds", exc_info=True)
+        return json.dumps({
+            "success": False,
+            "error": "Session summarization timed out.",
+        }, ensure_ascii=False)
+    
+    summaries = []
+    first_diagnostics = None
+    for (session_id, match_info, conversation_text, _), result in zip(tasks, results):
+        if isinstance(result, Exception):
+            logging.warning("Failed to summarize session %s: %s", session_id, result, exc_info=True)
+            result = None
+        
+        if first_diagnostics is None and "_diagnostics" in match_info:
+            first_diagnostics = match_info.pop("_diagnostics")
+        elif "_diagnostics" in match_info:
+            del match_info["_diagnostics"]
+        
+        entry = {
+            "session_id": session_id,
+            "when": _format_timestamp(match_info.get("session_started")),
+            "source": match_info.get("source", "unknown"),
+            "model": match_info.get("model"),
+            "hybrid_score": match_info.get("rrf_score", 0.0),
+        }
+        
+        if result:
+            entry["summary"] = result
+        else:
+            preview = (conversation_text[:500] + "\n…[truncated]") if conversation_text else "No preview available."
+            entry["summary"] = f"[Raw preview]\n{preview}"
+        
+        summaries.append(entry)
+    
+    result = {
+        "success": True,
+        "query": query,
+        "engine": "hybrid",
+        "results": summaries,
+        "count": len(summaries),
+        "sessions_searched": len(unique_sessions),
+    }
+    if first_diagnostics:
+        result["diagnostics"] = first_diagnostics
+    return json.dumps(result, ensure_ascii=False)
+
+
 def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
     """Return metadata for the most recent sessions (no LLM calls)."""
     try:
@@ -348,15 +491,112 @@ def session_search(
             limit = int(limit)
         except (TypeError, ValueError):
             limit = 3
-    limit = max(1, min(limit, 5))  # Clamp to [1, 5]
+    limit = max(1, min(limit, 5))
 
-    # Recent sessions mode: when query is empty, return metadata for recent sessions.
-    # No LLM calls — just DB queries for titles, previews, timestamps.
+    import time as _time
+    _search_start = _time.monotonic()
+    _search_engine = "bm25"
+    _search_result_count = 0
+    _search_error = None
+
+    def _log_and_return(result_str: str) -> str:
+        nonlocal _search_engine, _search_result_count, _search_error
+        elapsed = _time.monotonic() - _search_start
+        try:
+            parsed = json.loads(result_str) if isinstance(result_str, str) and result_str.startswith("{") else {}
+            _search_engine = parsed.get("engine", _search_engine)
+            _search_result_count = parsed.get("count", 0)
+            if not parsed.get("success", True):
+                _search_error = parsed.get("error", "unknown")
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        parts = [f"session_search query={query!r} engine={_search_engine} count={_search_result_count}"]
+        if _search_error:
+            parts.append(f"error={_search_error}")
+
+        try:
+            diag = parsed.get("diagnostics", {})
+            if diag:
+                bm25_hits = diag.get("bm25_hits")
+                vec_hits = diag.get("vector_hits")
+                vec_before = diag.get("vec_before_threshold")
+                vec_thresh = diag.get("vec_distance_threshold")
+                fused_before = diag.get("fused_before_rrf_threshold")
+                fused_after = diag.get("fused_after_rrf_threshold")
+                rrf_thresh = diag.get("rrf_score_threshold")
+                if bm25_hits is not None:
+                    parts.append(f"bm25={bm25_hits}")
+                if vec_before is not None:
+                    parts.append(f"vec_raw={vec_before}")
+                if vec_hits is not None:
+                    parts.append(f"vec_filtered={vec_hits}")
+                if vec_thresh is not None:
+                    parts.append(f"vec_thresh={vec_thresh}")
+                if fused_before is not None:
+                    parts.append(f"fused_before={fused_before}")
+                if fused_after is not None:
+                    parts.append(f"fused_after={fused_after}")
+                if rrf_thresh is not None and rrf_thresh > 0:
+                    parts.append(f"rrf_thresh={rrf_thresh}")
+        except Exception:
+            pass
+
+        results_list = parsed.get("results", [])
+        if results_list and isinstance(results_list, list):
+            summary_snippets = []
+            for r in results_list[:3]:
+                s = r.get("summary", "")
+                if s:
+                    summary_snippets.append(s[:80].replace("\n", " "))
+            if summary_snippets:
+                parts.append(f"summaries={summary_snippets}")
+
+        parts.append(f"elapsed={elapsed:.2f}s")
+        logging.info(" ".join(parts))
+        return result_str
+
+    if db is None:
+        logging.warning("session_search called but db is None")
+        return _log_and_return(tool_error("Session database not available.", success=False))
+
     if not query or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id)
+        return _log_and_return(_list_recent_sessions(db, limit, current_session_id))
 
     query = query.strip()
 
+    # Determine which search engine to use
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        session_search_config = config.get("auxiliary", {}).get("session_search", {}) if isinstance(config, dict) else {}
+        engine = session_search_config.get("engine", "bm25")
+    except Exception as e:
+        logging.debug("Failed to load session_search config: %s", e)
+        engine = "bm25"
+
+    # Route to appropriate search engine
+    if engine == "hybrid":
+        hybrid_result = _try_hybrid_search(query, limit, db, current_session_id, session_search_config)
+        if hybrid_result is not None:
+            return _log_and_return(hybrid_result)
+        return _log_and_return(json.dumps({
+            "success": False,
+            "query": query,
+            "engine": "hybrid",
+            "error": "Hybrid search is configured but unavailable.",
+        }, ensure_ascii=False))
+    elif engine == "auto":
+        hybrid_result = _try_hybrid_search(query, limit, db, current_session_id, session_search_config)
+        if hybrid_result is not None:
+            try:
+                parsed = json.loads(hybrid_result)
+                if parsed.get("count", 0) > 0:
+                    return _log_and_return(hybrid_result)
+            except (json.JSONDecodeError, TypeError):
+                return _log_and_return(hybrid_result)
+    
+    # BM25 search (default or fallback)
     try:
         # Parse role filter
         role_list = None
@@ -373,13 +613,15 @@ def session_search(
         )
 
         if not raw_results:
-            return json.dumps({
+            return _log_and_return(json.dumps({
                 "success": True,
                 "query": query,
+                "engine": "bm25",
                 "results": [],
                 "count": 0,
                 "message": "No matching sessions found.",
-            }, ensure_ascii=False)
+                "diagnostics": {"bm25_hits": 0},
+            }, ensure_ascii=False))
 
         # Resolve child sessions to their parent — delegation stores detailed
         # content in child sessions, but the user's conversation is the parent.
@@ -481,10 +723,10 @@ def session_search(
                 "Session summarization timed out after 60 seconds",
                 exc_info=True,
             )
-            return json.dumps({
+            return _log_and_return(json.dumps({
                 "success": False,
                 "error": "Session summarization timed out. Try a more specific query or reduce the limit.",
-            }, ensure_ascii=False)
+            }, ensure_ascii=False))
 
         summaries = []
         for (session_id, match_info, conversation_text, session_meta), result in zip(tasks, results):
@@ -519,24 +761,33 @@ def session_search(
 
             summaries.append(entry)
 
-        return json.dumps({
+        return _log_and_return(json.dumps({
             "success": True,
             "query": query,
+            "engine": "bm25",
             "results": summaries,
             "count": len(summaries),
             "sessions_searched": len(seen_sessions),
-        }, ensure_ascii=False)
+            "diagnostics": {"bm25_hits": len(raw_results), "sessions_after_dedup": len(seen_sessions)},
+        }, ensure_ascii=False))
 
     except Exception as e:
         logging.error("Session search failed: %s", e, exc_info=True)
-        return tool_error(f"Search failed: {str(e)}", success=False)
+        return _log_and_return(tool_error(f"Search failed: {str(e)}", success=False))
 
 
 def check_session_search_requirements() -> bool:
-    """Requires SQLite state database and an auxiliary text model."""
     try:
         from hermes_state import DEFAULT_DB_PATH
         return DEFAULT_DB_PATH.parent.exists()
+    except ImportError:
+        return False
+
+
+def check_hybrid_search_requirements() -> bool:
+    try:
+        from tools.hybrid_search import check_hybrid_search_requirements as _check
+        return _check()
     except ImportError:
         return False
 
@@ -603,4 +854,137 @@ registry.register(
         current_session_id=kw.get("current_session_id")),
     check_fn=check_session_search_requirements,
     emoji="🔍",
+)
+
+
+REBUILD_HYBRID_INDEX_SCHEMA = {
+    "name": "rebuild_hybrid_index",
+    "description": (
+        "Rebuild the hybrid search vector index from scratch. "
+        "Use this when search results seem stale or after changing index_roles config. "
+        "This drops and recreates the vector index table, then re-indexes all eligible messages. "
+        "May take several minutes for large databases."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+
+def rebuild_hybrid_index(db=None) -> str:
+    from tools.hybrid_search import get_hybrid_search, check_hybrid_search_requirements
+    if not check_hybrid_search_requirements():
+        return json.dumps({"error": "Hybrid search not available (sqlite-vec or API key missing)"}, ensure_ascii=False)
+    try:
+        from hermes_cli.config import load_config
+        config = load_config().get("auxiliary", {}).get("session_search", {})
+    except Exception:
+        config = {}
+    hybrid = get_hybrid_search(db, config=config)
+    result = hybrid.rebuild_index()
+    return json.dumps(result, ensure_ascii=False)
+
+
+registry.register(
+    name="rebuild_hybrid_index",
+    toolset="session_search",
+    schema=REBUILD_HYBRID_INDEX_SCHEMA,
+    handler=lambda args, **kw: rebuild_hybrid_index(db=kw.get("db")),
+    check_fn=check_hybrid_search_requirements,
+    emoji="🔄",
+)
+
+
+HYBRID_INDEX_STATUS_SCHEMA = {
+    "name": "hybrid_index_status",
+    "description": (
+        "Check the status of the hybrid search vector index. "
+        "Returns indexing progress, total messages, indexed count, and configuration. "
+        "Use this to diagnose why hybrid search might not be returning results, "
+        "or to check if indexing is complete before searching."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+
+def hybrid_index_status(db=None) -> str:
+    from tools.hybrid_search import get_hybrid_search, check_hybrid_search_requirements
+    available = check_hybrid_search_requirements()
+    if not available:
+        return json.dumps({
+            "available": False,
+            "reason": "sqlite-vec or API key missing",
+        }, ensure_ascii=False)
+    try:
+        from hermes_cli.config import load_config
+        config = load_config().get("auxiliary", {}).get("session_search", {})
+    except Exception:
+        config = {}
+    hybrid = get_hybrid_search(db, config=config)
+    status = hybrid.index_status()
+    status["available"] = True
+    status["engine_config"] = config.get("engine", "bm25")
+    return json.dumps(status, ensure_ascii=False)
+
+
+registry.register(
+    name="hybrid_index_status",
+    toolset="session_search",
+    schema=HYBRID_INDEX_STATUS_SCHEMA,
+    handler=lambda args, **kw: hybrid_index_status(db=kw.get("db")),
+    check_fn=lambda: True,
+    emoji="📊",
+)
+
+
+INDEX_UNINDEXED_MESSAGES_SCHEMA = {
+    "name": "index_unindexed_messages",
+    "description": (
+        "Index all unindexed messages into the hybrid search vector index. "
+        "Use this when hybrid search is not finding recent messages, "
+        "or after checking hybrid_index_status shows a large unindexed count. "
+        "This triggers batch embedding API calls and may take a while for large datasets."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+
+def index_unindexed_messages(db=None) -> str:
+    from tools.hybrid_search import get_hybrid_search, check_hybrid_search_requirements
+    available = check_hybrid_search_requirements()
+    if not available:
+        return json.dumps({
+            "success": False,
+            "error": "hybrid search not available (sqlite-vec or API key missing)",
+        }, ensure_ascii=False)
+    try:
+        from hermes_cli.config import load_config
+        config = load_config().get("auxiliary", {}).get("session_search", {})
+    except Exception:
+        config = {}
+    hybrid = get_hybrid_search(db, config=config)
+    result = hybrid._index_unindexed_batch()
+    result["success"] = True
+    return json.dumps(result, ensure_ascii=False)
+
+
+registry.register(
+    name="index_unindexed_messages",
+    toolset="session_search",
+    schema=INDEX_UNINDEXED_MESSAGES_SCHEMA,
+    handler=lambda args, **kw: index_unindexed_messages(
+        db=kw.get("db"),
+    ),
+    check_fn=check_hybrid_search_requirements,
+    emoji="📇",
 )
