@@ -1219,6 +1219,11 @@ class HybridSessionSearch:
                 "index_roles": self.index_roles,
                 "role_breakdown": role_breakdown,
                 "indexed_by_role": indexed_by_role,
+                "unindexed_by_role": {
+                    role: role_breakdown.get(role, 0) - indexed_by_role.get(role, 0)
+                    for role in role_breakdown
+                    if role_breakdown.get(role, 0) - indexed_by_role.get(role, 0) > 0
+                },
                 "min_content_length": self.min_content_length,
                 "batch_token_limit": self.batch_token_limit,
                 "idle_index_interval": self._idle_index_interval,
