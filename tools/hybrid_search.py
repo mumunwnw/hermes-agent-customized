@@ -622,11 +622,11 @@ class HybridSessionSearch:
     def _bm25_search(self, query: str, limit: int = 50) -> List[Dict[str, Any]]:
         """BM25 关键词搜索（使用 FTS5）。"""
         try:
-            # 使用现有的 FTS5 搜索
             results = self.db.search_messages(
                 query,
                 limit=limit,
                 offset=0,
+                role_filter=list(self.index_roles) if self.index_roles else None,
             )
             
             # 转换为标准格式
@@ -730,16 +730,16 @@ class HybridSessionSearch:
             
             formatted = []
             for r in results:
-                distance = _row_get(r, "distance")
+                distance = r[5]
                 if distance is None:
                     continue
-                content = _row_get(r, "content") or ""
+                content = r[2] or ""
                 formatted.append({
-                    "message_id": _row_get(r, "id"),
-                    "session_id": _row_get(r, "session_id"),
+                    "message_id": r[0],
+                    "session_id": r[1],
                     "content": content,
-                    "role": _row_get(r, "role"),
-                    "timestamp": _row_get(r, "timestamp"),
+                    "role": r[3],
+                    "timestamp": r[4],
                     "snippet": content[:200] + "...",
                     "vector_distance": distance,
                 })
@@ -929,6 +929,9 @@ class HybridSessionSearch:
         if not self.vec_available or not self.api_key:
             return 0
         
+        if not self._ensure_vec_loaded():
+            return 0
+        
         try:
             role_clause, role_params = self._role_filter_sql("m")
             min_len_clause, min_len_params = self._min_length_sql("m")
@@ -1104,7 +1107,7 @@ class HybridSessionSearch:
             self.db._conn.commit()
             logger.info("Dropped message_vec table for rebuild")
             
-            self._load_vec_extension()
+            self._ensure_vec_loaded()
             
             # Inline the indexing logic instead of calling _index_unindexed_batch
             # which would try to re-acquire _indexing_lock (non-reentrant deadlock)
