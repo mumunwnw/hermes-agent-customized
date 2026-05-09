@@ -244,7 +244,7 @@ class EmbeddingIndexer:
             
             for batch in batches:
                 if stop_event and stop_event.is_set():
-                    logger.info("索引批量中止: 收到停止信号")
+                    logger.info("Indexing batch aborted → stop event received")
                     break
                 
                 texts = []
@@ -491,7 +491,7 @@ class HybridSessionSearch:
         # 检查 sqlite-vec 可用性并加载扩展
         self.vec_available = self._load_vec_extension()
         if not self.vec_available:
-            logger.warning("sqlite-vec 不可用，向量搜索已禁用")
+            logger.warning("sqlite-vec not available, vector search disabled")
         
         # 初始化索引器
         self.indexer = EmbeddingIndexer(
@@ -1053,7 +1053,7 @@ class HybridSessionSearch:
 
     def _start_auto_index_daemon(self):
         def _daemon_loop():
-            logger.info("空闲索引守护线程已启动 (间隔=%ds)",
+            logger.info("Idle-index daemon started (interval=%ds)",
                          self._idle_index_interval)
             check_interval = min(self._idle_index_interval, 30)
             while not self._stop_event.is_set():
@@ -1073,7 +1073,7 @@ class HybridSessionSearch:
                     count = self._count_unindexed()
                     if count <= 0:
                         continue
-                    logger.info("空闲索引: 空闲 %.0fs >= %ds, %d 条未索引, 开始批量索引",
+                    logger.info("Idle-index: idle %.0fs >= %ds, %d unindexed → starting batch",
                                  idle_seconds, self._idle_index_interval, count)
                     if not self._indexing_lock.acquire(blocking=False):
                         continue
@@ -1089,7 +1089,7 @@ class HybridSessionSearch:
                         self._indexing_lock.release()
                 except Exception as e:
                     logger.warning("Idle-index daemon error: %s", e)
-            logger.info("空闲索引守护线程已停止")
+            logger.info("Idle-index daemon stopped")
         
         thread = threading.Thread(target=_daemon_loop, daemon=True, name="hybrid-idle-index")
         thread.start()
@@ -1125,7 +1125,7 @@ class HybridSessionSearch:
     def index_session(self, session_id: str = None):
         result = self._index_unindexed_batch()
         if result.get("total_processed", 0) > 0:
-            logger.info("索引完成: %s", result)
+            logger.info("Indexing complete: %s", result)
     
     def index_status(self) -> Dict[str, Any]:
         conn = self._thread_safe_conn()
@@ -1192,7 +1192,7 @@ class HybridSessionSearch:
             try:
                 write_conn.execute("DROP TABLE IF EXISTS message_vec")
                 write_conn.commit()
-                logger.info("已删除 message_vec 表，准备重建索引")
+                logger.info("Dropped message_vec table → rebuilding index")
             finally:
                 try:
                     write_conn.close()
@@ -1254,7 +1254,7 @@ def reset_hybrid_search():
 def check_hybrid_search_requirements() -> bool:
     """检查混合搜索是否可用。"""
     if not _check_sqlite_vec_available():
-        logger.info("混合搜索不可用: sqlite-vec 未安装")
+        logger.info("Hybrid search unavailable: sqlite-vec not installed")
         return False
     
     api_key = os.environ.get("SILICONFLOW_API_KEY", "")
@@ -1268,7 +1268,7 @@ def check_hybrid_search_requirements() -> bool:
             pass
     
     if not api_key:
-        logger.info("混合搜索不可用: 未配置 embedding API 密钥")
+        logger.info("Hybrid search unavailable: no embed API key configured")
         return False
     
     return True

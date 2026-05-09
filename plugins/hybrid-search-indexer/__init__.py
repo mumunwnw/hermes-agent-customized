@@ -39,7 +39,7 @@ def _on_session_finalize(session_id: str = None, platform: str = "", **_: Any) -
             except Exception:
                 pass
     except Exception as exc:
-        logger.warning("混合搜索索引器: 索引失败: %s", exc)
+        logger.warning("hybrid-search-indexer: indexing failed: %s", exc)
 
 
 def register(ctx) -> None:

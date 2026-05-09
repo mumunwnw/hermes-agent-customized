@@ -560,12 +560,10 @@ def session_search(
         except (json.JSONDecodeError, TypeError):
             pass
 
-        engine_label = {"bm25": "关键词", "hybrid": "混合"}.get(_search_engine, _search_engine)
-        
         if _search_error:
             logging.info(
-                "🔍 会话搜索 | 查询=%r | 引擎=%s | 结果=失败 | 错误=%s | 耗时=%.1fs",
-                query, engine_label, _search_error, elapsed
+                "🔍 session_search | query=%r | engine=%s | FAILED | error=%s | %.1fs",
+                query, _search_engine, _search_error, elapsed
             )
         else:
             diag = {}
@@ -583,30 +581,29 @@ def session_search(
                 fused_after = diag.get("fused_after_rrf_threshold", 0)
                 rrf_thresh = diag.get("rrf_score_threshold", 0)
                 
-                detail_parts = [f"BM25命中={bm25}"]
-                detail_parts.append(f"向量原始={vec_raw}")
+                pipeline = f"bm25={bm25} → vec_raw={vec_raw}"
                 if vec_raw != vec_filtered:
-                    detail_parts.append(f"向量过滤后={vec_filtered}(阈值={vec_thresh})")
-                detail_parts.append(f"融合前={fused_before}")
+                    pipeline += f" → vec_filtered={vec_filtered}(thresh={vec_thresh})"
+                pipeline += f" → fused={fused_before}"
                 if rrf_thresh > 0:
-                    detail_parts.append(f"RRF过滤后={fused_after}(阈值={rrf_thresh})")
-                detail = " | ".join(detail_parts)
+                    pipeline += f" → rrf_filtered={fused_after}(thresh={rrf_thresh})"
+                pipeline += f" → result={_search_result_count}"
                 
                 logging.info(
-                    "🔍 会话搜索 | 查询=%r | 引擎=混合 | 结果=%d条 | %s | 耗时=%.1fs",
-                    query, _search_result_count, detail, elapsed
+                    "🔍 session_search | query=%r | hybrid | %s | %.1fs",
+                    query, pipeline, elapsed
                 )
             elif _search_engine == "bm25" and diag:
                 bm25 = diag.get("bm25_hits", 0)
                 sessions = diag.get("sessions_after_dedup", 0)
                 logging.info(
-                    "🔍 会话搜索 | 查询=%r | 引擎=关键词 | 结果=%d条 | BM25命中=%d | 去重后=%d个会话 | 耗时=%.1fs",
-                    query, _search_result_count, bm25, sessions, elapsed
+                    "🔍 session_search | query=%r | bm25 | hits=%d → dedup=%d → result=%d | %.1fs",
+                    query, bm25, sessions, _search_result_count, elapsed
                 )
             else:
                 logging.info(
-                    "🔍 会话搜索 | 查询=%r | 引擎=%s | 结果=%d条 | 耗时=%.1fs",
-                    query, engine_label, _search_result_count, elapsed
+                    "🔍 session_search | query=%r | engine=%s | result=%d | %.1fs",
+                    query, _search_engine, _search_result_count, elapsed
                 )
 
         return result_str
