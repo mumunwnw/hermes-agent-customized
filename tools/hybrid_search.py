@@ -926,27 +926,78 @@ class HybridSessionSearch:
         if not db_path:
             return None
         
-        import sqlite3
-        conn = sqlite3.connect(str(db_path))
-        conn.row_factory = sqlite3.Row
+        conn = None
+        vec_loaded = False
         
         if self.vec_available:
             try:
                 import sqlite_vec
+                
+                # Method 1: pysqlite3 (most reliable on macOS)
                 try:
+                    from pysqlite3 import dbapi2 as pysqlite
+                    conn = pysqlite.connect(str(db_path), check_same_thread=False)
                     conn.enable_load_extension(True)
-                except AttributeError:
-                    pass
-                try:
                     sqlite_vec.load(conn)
-                    try:
-                        conn.enable_load_extension(False)
-                    except AttributeError:
-                        pass
+                    conn.enable_load_extension(False)
+                    conn.row_factory = pysqlite.Row
+                    vec_loaded = True
                 except Exception:
-                    pass
+                    if conn:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    conn = None
+                
+                # Method 2: standard sqlite3 + sqlite_vec.load()
+                if not vec_loaded:
+                    try:
+                        import sqlite3
+                        conn = sqlite3.connect(str(db_path))
+                        conn.row_factory = sqlite3.Row
+                        conn.enable_load_extension(True)
+                        sqlite_vec.load(conn)
+                        conn.enable_load_extension(False)
+                        vec_loaded = True
+                    except Exception:
+                        if conn:
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
+                        conn = None
+                
+                # Method 3: standard sqlite3 + loadable_path
+                if not vec_loaded:
+                    try:
+                        import sqlite3
+                        conn = sqlite3.connect(str(db_path))
+                        conn.row_factory = sqlite3.Row
+                        vec_path = sqlite_vec.loadable_path()
+                        if callable(vec_path):
+                            vec_path = vec_path()
+                        import sys
+                        if sys.platform == "darwin" and not str(vec_path).endswith(".dylib"):
+                            vec_path = str(vec_path) + ".dylib"
+                        conn.enable_load_extension(True)
+                        conn.load_extension(str(vec_path))
+                        conn.enable_load_extension(False)
+                        vec_loaded = True
+                    except Exception:
+                        if conn:
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
+                        conn = None
             except ImportError:
                 pass
+        
+        if conn is None:
+            import sqlite3
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
         
         _thread_local.hybrid_conn = conn
         return conn
