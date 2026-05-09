@@ -6831,10 +6831,10 @@ def _cmd_update_check():
             text=True,
         )
         upstream_exists = False
-        compare_branch = "origin/stable"
+        compare_branch = "origin/main"
     else:
         upstream_exists = True
-        compare_branch = "upstream/stable"
+        compare_branch = "upstream/main"
 
     if fetch_result.returncode != 0:
         stderr = fetch_result.stderr.strip()
@@ -7326,9 +7326,38 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
             )
 
-        # Fork upstream sync logic (for forks — sync main with upstream, then re-merge into stable)
+        # Fork upstream sync logic (for forks — sync main with upstream, then merge into stable)
         if is_fork:
+            # _sync_with_upstream_if_needed operates on main branch (git pull upstream main),
+            # so we must switch to main first, then switch back and merge into stable.
+            saved_branch = branch
+            subprocess.run(
+                git_cmd + ["checkout", "main"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
             _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
+            subprocess.run(
+                git_cmd + ["checkout", saved_branch],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            # Merge updated main into stable
+            merge_result = subprocess.run(
+                git_cmd + ["merge", "main", "--no-edit"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+            )
+            if merge_result.returncode == 0:
+                print("  ✓ Merged upstream updates into stable")
+            else:
+                print("  ⚠ Could not auto-merge main into stable.")
+                print("    Resolve conflicts manually, then commit.")
 
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra
         # breaks on this machine, keep base deps and reinstall the remaining extras
