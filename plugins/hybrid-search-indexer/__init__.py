@@ -20,9 +20,11 @@ def _on_session_finalize(session_id: str = None, platform: str = "", **_: Any) -
     try:
         from tools.hybrid_search import get_hybrid_search, check_hybrid_search_requirements, HybridSessionSearch
         if not check_hybrid_search_requirements():
+            logger.debug("Session finalize: hybrid search requirements not met, skipping index")
             return
         from tools.hybrid_search import _hybrid_instance
         if _hybrid_instance is not None:
+            logger.info("Session finalize: triggering index (session=%s, platform=%s)", session_id, platform)
             _hybrid_instance.index_session()
             return
         from hermes_state import SessionDB
@@ -30,6 +32,7 @@ def _on_session_finalize(session_id: str = None, platform: str = "", **_: Any) -
         db_path = get_hermes_home() / "state.db"
         db = SessionDB(db_path)
         try:
+            logger.info("Session finalize: creating standalone indexer (session=%s)", session_id)
             search = HybridSessionSearch(db, config=ss_config)
             search.index_session()
             search.stop_auto_index_daemon()
@@ -39,7 +42,7 @@ def _on_session_finalize(session_id: str = None, platform: str = "", **_: Any) -
             except Exception:
                 pass
     except Exception as exc:
-        logger.warning("hybrid-search-indexer: indexing failed: %s", exc)
+        logger.warning("Session finalize: indexing failed: %s", exc)
 
 
 def register(ctx) -> None:

@@ -188,6 +188,9 @@ class EmbeddingIndexer:
         if not items or not self.api_key:
             return
         
+        batch_start_indexed = self.indexed_count
+        batch_start_failed = self.failed_count
+        
         import sqlite_vec
         
         db_path = getattr(self.db, 'db_path', None) or getattr(self.db, '_db_path', None)
@@ -247,7 +250,7 @@ class EmbeddingIndexer:
             
             for batch in batches:
                 if stop_event and stop_event.is_set():
-                    logger.info("Indexing batch aborted → stop event received")
+                    logger.info("Index batch: aborted → stop event received")
                     break
                 
                 texts = []
@@ -287,6 +290,14 @@ class EmbeddingIndexer:
                         self._increment_failed()
                 
                 conn.commit()
+            
+            logger.debug(
+                "Index batch (embedding): %d items → %d indexed, %d failed, %d skipped",
+                len(items),
+                self.indexed_count - batch_start_indexed,
+                self.failed_count - batch_start_failed,
+                len(items) - (self.indexed_count - batch_start_indexed) - (self.failed_count - batch_start_failed),
+            )
         finally:
             if conn:
                 conn.close()
@@ -785,6 +796,7 @@ class HybridSessionSearch:
             return []
         
         query = query.strip()
+        search_start = time.monotonic()
         
         bm25_results = self._bm25_search(query, limit=50)
         vector_results_raw = self._vector_search(query, limit=50)
@@ -801,6 +813,25 @@ class HybridSessionSearch:
         
         if self.use_reranker and fused_results:
             fused_results = self._rerank_results(query, fused_results, limit=limit)
+        
+        elapsed = time.monotonic() - search_start
+        
+        pipeline = f"bm25={len(bm25_results)}"
+        if vec_before_threshold != len(vector_results):
+            pipeline += f" → vec_raw={vec_before_threshold} → vec_filtered={len(vector_results)}(thresh={self.vec_distance_threshold})"
+        else:
+            pipeline += f" → vec={len(vector_results)}"
+        pipeline += f" → fused={fused_before_threshold}"
+        if self.rrf_score_threshold > 0:
+            pipeline += f" → rrf_filtered={len(fused_results)}(thresh={self.rrf_score_threshold})"
+        if self.use_reranker:
+            pipeline += f" → reranked={len(fused_results)}"
+        pipeline += f" → result={min(len(fused_results), limit)}"
+        
+        logger.info(
+            "Hybrid search | query=%r | %s | %.2fs",
+            query[:80], pipeline, elapsed,
+        )
         
         for r in fused_results[:limit]:
             r["_diagnostics"] = {
@@ -1088,7 +1119,7 @@ class HybridSessionSearch:
 
     def _start_auto_index_daemon(self):
         def _daemon_loop():
-            logger.info("Idle-index daemon started (interval=%ds)",
+            logger.info("Idle-index daemon: started (interval=%ds)",
                          self._idle_index_interval)
             check_interval = min(self._idle_index_interval, 30)
             while not self._stop_event.is_set():
@@ -1108,7 +1139,7 @@ class HybridSessionSearch:
                     count = self._count_unindexed()
                     if count <= 0:
                         continue
-                    logger.info("Idle-index: idle %.0fs >= %ds, %d unindexed → starting batch",
+                    logger.info("Idle-index daemon: idle %.0fs >= %ds, %d unindexed → starting batch",
                                  idle_seconds, self._idle_index_interval, count)
                     if not self._indexing_lock.acquire(blocking=False):
                         continue
@@ -1116,15 +1147,22 @@ class HybridSessionSearch:
                         items = self._fetch_unindexed(limit=500)
                         if items:
                             before = self.indexer.indexed_count
+                            before_failed = self.indexer.failed_count
                             self.indexer.index_batch(items, stop_event=self._stop_event)
                             batch_indexed = self.indexer.indexed_count - before
+                            batch_failed = self.indexer.failed_count - before_failed
+                            batch_skipped = len(items) - batch_indexed - batch_failed
                             if batch_indexed > 0:
                                 self._last_index_time = last_msg_time
+                            logger.info(
+                                "Idle-index daemon: complete → total=%d, indexed=%d, failed=%d, skipped=%d",
+                                len(items), batch_indexed, batch_failed, batch_skipped,
+                            )
                     finally:
                         self._indexing_lock.release()
                 except Exception as e:
-                    logger.warning("Idle-index daemon error: %s", e)
-            logger.info("Idle-index daemon stopped")
+                    logger.warning("Idle-index daemon: error → %s", e)
+            logger.info("Idle-index daemon: stopped")
         
         thread = threading.Thread(target=_daemon_loop, daemon=True, name="hybrid-idle-index")
         thread.start()
@@ -1142,16 +1180,31 @@ class HybridSessionSearch:
         try:
             items = self._fetch_unindexed(limit=limit)
             if not items:
+                logger.info("Index batch: no unindexed messages found")
                 return {"indexed": 0, "message": "No unindexed messages found"}
             
             before_indexed = self.indexer.indexed_count
             before_failed = self.indexer.failed_count
             
+            logger.info(
+                "Index batch: starting → %d items to index (limit=%s)",
+                len(items), limit or "none",
+            )
+            
             self.indexer.index_batch(items)
             
+            indexed = self.indexer.indexed_count - before_indexed
+            failed = self.indexer.failed_count - before_failed
+            skipped = len(items) - indexed - failed
+            
+            logger.info(
+                "Index batch: complete → total=%d, indexed=%d, failed=%d, skipped=%d",
+                len(items), indexed, failed, skipped,
+            )
+            
             return {
-                "indexed": self.indexer.indexed_count - before_indexed,
-                "failed": self.indexer.failed_count - before_failed,
+                "indexed": indexed,
+                "failed": failed,
                 "total_processed": len(items),
             }
         finally:
@@ -1159,8 +1212,12 @@ class HybridSessionSearch:
     
     def index_session(self, session_id: str = None):
         result = self._index_unindexed_batch()
-        if result.get("total_processed", 0) > 0:
-            logger.info("Indexing complete: %s", result)
+        total = result.get("total_processed", 0)
+        if total > 0:
+            logger.info(
+                "Session finalize: complete → total=%d, indexed=%d, failed=%d",
+                total, result.get("indexed", 0), result.get("failed", 0),
+            )
     
     def index_status(self) -> Dict[str, Any]:
         conn = self._thread_safe_conn()
@@ -1169,23 +1226,50 @@ class HybridSessionSearch:
         try:
             role_clause, role_params = self._role_filter_sql("m")
             min_len_clause, min_len_params = self._min_length_sql("m")
-            total_row = conn.execute(
+            
+            total_all_row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM messages"
+            ).fetchone()
+            total_all = total_all_row[0] if total_all_row else 0
+            
+            empty_content_row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM messages WHERE content IS NULL OR content = ''"
+            ).fetchone()
+            empty_content = empty_content_row[0] if empty_content_row else 0
+            
+            excluded_by_role_row = conn.execute(
+                f"SELECT COUNT(*) as cnt FROM messages WHERE content IS NOT NULL AND role NOT IN ({','.join('?' for _ in self.index_roles)})",
+                list(self.index_roles)
+            ).fetchone()
+            excluded_by_role = excluded_by_role_row[0] if excluded_by_role_row else 0
+            
+            excluded_by_length = 0
+            if self.min_content_length and self.min_content_length > 0:
+                excluded_by_length_row = conn.execute(
+                    "SELECT COUNT(*) as cnt FROM messages WHERE content IS NOT NULL AND LENGTH(content) < ?",
+                    [self.min_content_length]
+                ).fetchone()
+                excluded_by_length = excluded_by_length_row[0] if excluded_by_length_row else 0
+            
+            total_indexable_row = conn.execute(
                 f"SELECT COUNT(*) as cnt FROM messages m WHERE m.content IS NOT NULL {min_len_clause} {role_clause}",
                 min_len_params + role_params
             ).fetchone()
-            total = total_row[0] if total_row else 0
+            total_indexable = total_indexable_row[0] if total_indexable_row else 0
             
             vec_exists = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='message_vec'"
             ).fetchone()
             
+            indexed = 0
             if vec_exists:
                 idx_row = conn.execute(
-                    "SELECT COUNT(*) as cnt FROM message_vec"
+                    f"SELECT COUNT(*) as cnt FROM message_vec v JOIN messages m ON v.message_id = m.id {('WHERE ' + role_clause.replace('AND ', '')) if role_clause.strip() else ''}",
+                    role_params
                 ).fetchone()
                 indexed = idx_row[0] if idx_row else 0
-            else:
-                indexed = 0
+            
+            truly_unindexed = max(0, total_indexable - indexed)
             
             role_breakdown = {}
             try:
@@ -1208,22 +1292,44 @@ class HybridSessionSearch:
                 except Exception:
                     pass
             
+            unindexed_by_role = {}
+            for role in self.index_roles:
+                total_in_role = role_breakdown.get(role, 0)
+                if self.min_content_length and self.min_content_length > 0:
+                    try:
+                        role_len_row = conn.execute(
+                            "SELECT COUNT(*) as cnt FROM messages WHERE content IS NOT NULL AND LENGTH(content) >= ? AND role = ?",
+                            [self.min_content_length, role]
+                        ).fetchone()
+                        total_in_role = role_len_row[0] if role_len_row else 0
+                    except Exception:
+                        pass
+                idx_in_role = indexed_by_role.get(role, 0)
+                unindexed_in_role = total_in_role - idx_in_role
+                if unindexed_in_role > 0:
+                    unindexed_by_role[role] = unindexed_in_role
+            
+            non_indexable = total_all - total_indexable
+            
             return {
-                "total_indexable": total,
+                "total_messages": total_all,
+                "total_indexable": total_indexable,
                 "indexed": indexed,
-                "unindexed": total - indexed,
-                "indexing_progress": f"{indexed}/{total}",
+                "truly_unindexed": truly_unindexed,
+                "non_indexable": non_indexable,
+                "non_indexable_breakdown": {
+                    "empty_content": empty_content,
+                    "excluded_by_role": excluded_by_role,
+                    "excluded_by_length": excluded_by_length,
+                },
+                "indexing_progress": f"{indexed}/{total_indexable}",
                 "indexed_count": self.indexer.indexed_count,
                 "failed_count": self.indexer.failed_count,
                 "vec_available": self.vec_available,
                 "index_roles": self.index_roles,
                 "role_breakdown": role_breakdown,
                 "indexed_by_role": indexed_by_role,
-                "unindexed_by_role": {
-                    role: role_breakdown.get(role, 0) - indexed_by_role.get(role, 0)
-                    for role in role_breakdown
-                    if role_breakdown.get(role, 0) - indexed_by_role.get(role, 0) > 0
-                },
+                "unindexed_by_role": unindexed_by_role,
                 "min_content_length": self.min_content_length,
                 "batch_token_limit": self.batch_token_limit,
                 "idle_index_interval": self._idle_index_interval,
@@ -1261,7 +1367,7 @@ class HybridSessionSearch:
             try:
                 write_conn.execute("DROP TABLE IF EXISTS message_vec")
                 write_conn.commit()
-                logger.info("Dropped message_vec table → rebuilding index")
+                logger.info("Rebuild index: dropped message_vec table")
             finally:
                 try:
                     write_conn.close()
@@ -1278,16 +1384,28 @@ class HybridSessionSearch:
             
             items = self._fetch_unindexed()
             if not items:
+                logger.info("Rebuild index: no messages to index after dropping message_vec")
                 return {"indexed": 0, "message": "No messages to index after rebuild"}
             
             before_indexed = self.indexer.indexed_count
             before_failed = self.indexer.failed_count
             
+            logger.info("Rebuild index: starting → %d items to re-index", len(items))
+            
             self.indexer.index_batch(items)
             
+            indexed = self.indexer.indexed_count - before_indexed
+            failed = self.indexer.failed_count - before_failed
+            skipped = len(items) - indexed - failed
+            
+            logger.info(
+                "Rebuild index: complete → total=%d, indexed=%d, failed=%d, skipped=%d",
+                len(items), indexed, failed, skipped,
+            )
+            
             return {
-                "indexed": self.indexer.indexed_count - before_indexed,
-                "failed": self.indexer.failed_count - before_failed,
+                "indexed": indexed,
+                "failed": failed,
                 "total_processed": len(items),
             }
         except Exception as e:
