@@ -146,6 +146,7 @@ COMPONENT_PREFIXES = {
     "tools": ("tools",),
     "cli": ("hermes_cli", "cli"),
     "cron": ("cron",),
+    "hybrid_search": ("tools.hybrid_search", "hermes_plugins.hybrid_search_indexer"),
 }
 
 
@@ -243,6 +244,17 @@ def setup_logging(
             formatter=RedactingFormatter(_LOG_FORMAT),
             log_filter=_ComponentFilter(COMPONENT_PREFIXES["gateway"]),
         )
+
+    # --- hybrid_session_search.log (INFO+, hybrid search component only) ----
+    _add_rotating_handler(
+        root,
+        log_dir / "hybrid_session_search.log",
+        level=logging.INFO,
+        max_bytes=5 * 1024 * 1024,
+        backup_count=3,
+        formatter=RedactingFormatter(_LOG_FORMAT),
+        log_filter=_ComponentFilter(COMPONENT_PREFIXES["hybrid_search"]),
+    )
 
     if _logging_initialized and not force:
         return log_dir

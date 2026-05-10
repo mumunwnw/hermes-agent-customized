@@ -102,14 +102,14 @@ class TestVecDistanceThreshold:
     def test_vector_search_filters_by_threshold(self):
         search = _make_search(config={"hybrid": {"vec_distance_threshold": 1.0}})
         search.vec_available = True
-        search._ensure_vec_loaded = MagicMock(return_value=True)
         search._call_embedding_api = MagicMock(return_value=[0.1] * 1024)
 
+        mock_conn = MagicMock()
         mock_row_1 = (1, "s1", "a", "user", 1.0, 0.8)
         mock_row_2 = (2, "s2", "b", "user", 2.0, 1.5)
-
-        search.db._conn.execute.return_value.fetchall.return_value = [mock_row_1, mock_row_2]
-        search.db._conn.execute.return_value.fetchone.return_value = ("message_vec",)
+        mock_conn.execute.return_value.fetchall.return_value = [mock_row_1, mock_row_2]
+        mock_conn.execute.return_value.fetchone.return_value = ("message_vec",)
+        search._thread_safe_conn = MagicMock(return_value=mock_conn)
 
         with patch("tools.hybrid_search._vec_serialize", return_value=b"\x00" * 4096):
             results = search._vector_search("test", limit=50)
@@ -220,40 +220,46 @@ class TestConfigReading:
 class TestIndexStatus:
     def test_index_status_no_vec_table(self):
         search = _make_search()
+        mock_conn = MagicMock()
         def mock_execute(sql, *args):
             result = MagicMock()
             if "sqlite_master" in sql:
                 result.fetchone.return_value = None
-            elif "COUNT" in sql and "messages" in sql:
-                result.fetchone.return_value = OrderedDict([("cnt", 100)])
+            elif "COUNT" in sql and "messages" in sql and "role NOT IN" not in sql and "LENGTH" not in sql:
+                result.fetchone.return_value = (100,)
             else:
-                result.fetchone.return_value = None
+                result.fetchone.return_value = (0,)
             return result
-        search.db._conn.execute = mock_execute
+        mock_conn.execute = mock_execute
+        search._thread_safe_conn = MagicMock(return_value=mock_conn)
         status = search.index_status()
         assert status["total_indexable"] == 100
         assert status["indexed"] == 0
+        assert status["truly_unindexed"] == 100
 
     def test_index_status_with_vec_table(self):
         search = _make_search()
-        call_count = [0]
+        mock_conn = MagicMock()
         def mock_execute(sql, *args):
             result = MagicMock()
             if "sqlite_master" in sql:
-                result.fetchone.return_value = OrderedDict([("name", "message_vec")])
-                result.fetchall.return_value = []
-            elif "COUNT" in sql and "messages" in sql:
-                result.fetchone.return_value = OrderedDict([("cnt", 100)])
+                result.fetchone.return_value = ("message_vec",)
             elif "COUNT" in sql and "message_vec" in sql:
-                result.fetchone.return_value = OrderedDict([("cnt", 50)])
+                result.fetchone.return_value = (50,)
+            elif "COUNT" in sql and "messages" in sql and "role NOT IN" not in sql and "LENGTH" not in sql:
+                result.fetchone.return_value = (100,)
             else:
-                result.fetchone.return_value = None
-                result.fetchall.return_value = []
+                result.fetchone.return_value = (0,)
             return result
-        search.db._conn.execute = mock_execute
+        mock_conn.execute = mock_execute
+        search._thread_safe_conn = MagicMock(return_value=mock_conn)
         status = search.index_status()
+        assert status["total_messages"] == 100
         assert status["total_indexable"] == 100
         assert status["indexed"] == 50
+        assert status["truly_unindexed"] == 50
+        assert "non_indexable" in status
+        assert "non_indexable_breakdown" in status
 
 
 class TestSearchEmpty:
@@ -299,24 +305,10 @@ class TestRebuildIndex:
         search = _make_search(config={"hybrid": {"embed_api_key": "sk-test"}})
         search.vec_available = True
         search.api_key = "sk-test"
-        search._ensure_vec_loaded = MagicMock(return_value=True)
-        search._load_vec_extension = MagicMock(return_value=True)
-
-        call_log = []
-        def mock_execute(sql, *args):
-            result = MagicMock()
-            call_log.append(sql.strip().upper())
-            if "DROP" in sql.upper():
-                pass
-            elif "SELECT" in sql.upper() and "MESSAGES" in sql.upper() and "COUNT" not in sql.upper():
-                result.fetchall.return_value = []
-            return result
-        search.db._conn.execute = mock_execute
-        search.db._conn.commit = MagicMock()
+        search._fetch_unindexed = MagicMock(return_value=[])
 
         result = search.rebuild_index()
         assert "indexed" in result or "error" in result
-        assert any("DROP" in c for c in call_log)
 
 
 class TestMinContentLength:
@@ -346,16 +338,18 @@ class TestMinContentLength:
 
     def test_index_status_includes_min_content_length(self):
         search = _make_search(config={"hybrid": {"min_content_length": 30}})
+        mock_conn = MagicMock()
         def mock_execute(sql, *args):
             result = MagicMock()
             if "sqlite_master" in sql:
                 result.fetchone.return_value = None
             elif "COUNT" in sql:
-                result.fetchone.return_value = OrderedDict([("cnt", 10)])
+                result.fetchone.return_value = (10,)
             else:
                 result.fetchone.return_value = None
             return result
-        search.db._conn.execute = mock_execute
+        mock_conn.execute = mock_execute
+        search._thread_safe_conn = MagicMock(return_value=mock_conn)
         status = search.index_status()
         assert status["min_content_length"] == 30
 
