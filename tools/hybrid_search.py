@@ -1038,7 +1038,7 @@ class HybridSessionSearch:
             if not vec_exists:
                 rows = conn.execute(
                     f"""SELECT m.id, m.content, m.session_id, m.token_count FROM messages m
-                       WHERE m.content IS NOT NULL {min_len_clause}
+                       WHERE m.content IS NOT NULL AND m.content <> '' {min_len_clause}
                        {role_clause}
                        ORDER BY m.timestamp DESC {limit_clause}""",
                     min_len_params + role_params + limit_params
@@ -1048,7 +1048,7 @@ class HybridSessionSearch:
                     f"""SELECT m.id, m.content, m.session_id, m.token_count FROM messages m
                        LEFT JOIN message_vec v ON m.id = v.message_id
                        WHERE v.message_id IS NULL
-                         AND m.content IS NOT NULL {min_len_clause}
+                         AND m.content IS NOT NULL AND m.content <> '' {min_len_clause}
                        {role_clause}
                        ORDER BY m.timestamp DESC {limit_clause}""",
                     min_len_params + role_params + limit_params
@@ -1079,7 +1079,7 @@ class HybridSessionSearch:
             
             if not vec_exists:
                 row = conn.execute(
-                    f"SELECT COUNT(*) as cnt FROM messages m WHERE m.content IS NOT NULL {min_len_clause} {role_clause}",
+                    f"SELECT COUNT(*) as cnt FROM messages m WHERE m.content IS NOT NULL AND m.content <> '' {min_len_clause} {role_clause}",
                     min_len_params + role_params
                 ).fetchone()
             else:
@@ -1087,7 +1087,7 @@ class HybridSessionSearch:
                     f"""SELECT COUNT(*) as cnt FROM messages m
                        LEFT JOIN message_vec v ON m.id = v.message_id
                        WHERE v.message_id IS NULL
-                         AND m.content IS NOT NULL {min_len_clause} {role_clause}""",
+                         AND m.content IS NOT NULL AND m.content <> '' {min_len_clause} {role_clause}""",
                     min_len_params + role_params
                 ).fetchone()
             
@@ -1238,7 +1238,7 @@ class HybridSessionSearch:
             empty_content = empty_content_row[0] if empty_content_row else 0
             
             excluded_by_role_row = conn.execute(
-                f"SELECT COUNT(*) as cnt FROM messages WHERE content IS NOT NULL AND role NOT IN ({','.join('?' for _ in self.index_roles)})",
+                f"SELECT COUNT(*) as cnt FROM messages WHERE content IS NOT NULL AND content <> '' AND role NOT IN ({','.join('?' for _ in self.index_roles)})",
                 list(self.index_roles)
             ).fetchone()
             excluded_by_role = excluded_by_role_row[0] if excluded_by_role_row else 0
@@ -1246,16 +1246,18 @@ class HybridSessionSearch:
             excluded_by_length = 0
             if self.min_content_length and self.min_content_length > 0:
                 excluded_by_length_row = conn.execute(
-                    "SELECT COUNT(*) as cnt FROM messages WHERE content IS NOT NULL AND LENGTH(content) < ?",
-                    [self.min_content_length]
+                    f"SELECT COUNT(*) as cnt FROM messages WHERE content IS NOT NULL AND content <> '' AND LENGTH(content) < ? AND role IN ({','.join('?' for _ in self.index_roles)})",
+                    [self.min_content_length] + list(self.index_roles)
                 ).fetchone()
                 excluded_by_length = excluded_by_length_row[0] if excluded_by_length_row else 0
             
             total_indexable_row = conn.execute(
-                f"SELECT COUNT(*) as cnt FROM messages m WHERE m.content IS NOT NULL {min_len_clause} {role_clause}",
+                f"SELECT COUNT(*) as cnt FROM messages m WHERE m.content IS NOT NULL AND m.content <> '' {min_len_clause} {role_clause}",
                 min_len_params + role_params
             ).fetchone()
             total_indexable = total_indexable_row[0] if total_indexable_row else 0
+            
+            non_indexable = empty_content + excluded_by_role + excluded_by_length
             
             vec_exists = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='message_vec'"
@@ -1274,7 +1276,7 @@ class HybridSessionSearch:
             role_breakdown = {}
             try:
                 role_rows = conn.execute(
-                    "SELECT role, COUNT(*) as cnt FROM messages WHERE content IS NOT NULL GROUP BY role"
+                    "SELECT role, COUNT(*) as cnt FROM messages WHERE content IS NOT NULL AND content <> '' GROUP BY role"
                 ).fetchall()
                 for row in role_rows:
                     role_breakdown[row[0]] = row[1]
@@ -1298,7 +1300,7 @@ class HybridSessionSearch:
                 if self.min_content_length and self.min_content_length > 0:
                     try:
                         role_len_row = conn.execute(
-                            "SELECT COUNT(*) as cnt FROM messages WHERE content IS NOT NULL AND LENGTH(content) >= ? AND role = ?",
+                            "SELECT COUNT(*) as cnt FROM messages WHERE content IS NOT NULL AND content <> '' AND LENGTH(content) >= ? AND role = ?",
                             [self.min_content_length, role]
                         ).fetchone()
                         total_in_role = role_len_row[0] if role_len_row else 0
@@ -1308,8 +1310,6 @@ class HybridSessionSearch:
                 unindexed_in_role = total_in_role - idx_in_role
                 if unindexed_in_role > 0:
                     unindexed_by_role[role] = unindexed_in_role
-            
-            non_indexable = total_all - total_indexable
             
             return {
                 "total_messages": total_all,
