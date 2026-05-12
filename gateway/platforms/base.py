@@ -71,13 +71,16 @@ def _reply_anchor_for_event(event) -> str | None:
     and do not route with ``direct_messages_topic_id``. Those lanes only remain
     visible when sent with both the private topic thread id and a reply to the
     triggering user message.
+
+    Feishu's reply_to behavior is controlled by the adapter's
+    ``disable_reply_to`` config — the adapter's ``_effective_reply_to()``
+    method decides whether to use or discard the anchor.  This function
+    still returns the anchor so the adapter can make that decision.
     """
     source = getattr(event, "source", None)
     platform = _platform_name(getattr(source, "platform", None))
     thread_id = getattr(source, "thread_id", None)
     if platform == "telegram" and thread_id and getattr(source, "chat_type", None) == "dm":
-        # Reply to the triggering user message. Replying to Telegram's earlier
-        # topic seed/anchor can render the bot response outside the active lane.
         return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)
     if platform == "telegram" and thread_id:
         return None

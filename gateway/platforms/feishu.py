@@ -227,7 +227,6 @@ _APPROVAL_LABEL_MAP: Dict[str, str] = {
     "deny": "Denied",
 }
 _FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
-_FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
 
 # Feishu reactions render as prominent badges, unlike Discord/Telegram's
 # small footer emoji — a success badge on every message would add noise, so
@@ -239,6 +238,8 @@ _FEISHU_REACTION_FAILURE = "CrossMark"
 # drain on completion; the cap is a safeguard against unbounded growth from
 # delete-failures, not a capacity plan.
 _FEISHU_PROCESSING_REACTION_CACHE_SIZE = 1024
+
+_FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})
 
 # QR onboarding constants
 _ONBOARD_ACCOUNTS_URLS = {
@@ -393,6 +394,11 @@ class FeishuAdapterSettings:
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
+    paragraph_split: bool = True
+    paragraph_delay_ms: int = 1200
+    paragraph_min_length: int = 200
+    paragraph_max_length: int = 1500
+    disable_reply_to: bool = True
 
 
 @dataclass
@@ -1510,6 +1516,24 @@ class FeishuAdapter(BasePlatformAdapter):
             require_mention=_to_boolean(
                 extra.get("require_mention", os.getenv("FEISHU_REQUIRE_MENTION", "true"))
             ),
+            paragraph_split=_to_boolean(
+                extra.get("paragraph_split", os.getenv("FEISHU_PARAGRAPH_SPLIT", "true"))
+            ),
+            paragraph_delay_ms=max(
+                0,
+                int(extra.get("paragraph_delay_ms", os.getenv("FEISHU_PARAGRAPH_DELAY_MS", "1200")))
+            ),
+            paragraph_min_length=max(
+                50,
+                int(extra.get("paragraph_min_length", os.getenv("FEISHU_PARAGRAPH_MIN_LENGTH", "200")))
+            ),
+            paragraph_max_length=max(
+                200,
+                int(extra.get("paragraph_max_length", os.getenv("FEISHU_PARAGRAPH_MAX_LENGTH", "1500")))
+            ),
+            disable_reply_to=_to_boolean(
+                extra.get("disable_reply_to", os.getenv("FEISHU_DISABLE_REPLY_TO", "true"))
+            ),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1542,6 +1566,13 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_ping_timeout = settings.ws_ping_timeout
         self._allow_bots = settings.allow_bots
         self._require_mention = settings.require_mention
+        self._paragraph_split = settings.paragraph_split
+        self._paragraph_delay_ms = settings.paragraph_delay_ms
+        self._paragraph_min_length = settings.paragraph_min_length
+        self._paragraph_max_length = max(
+            settings.paragraph_min_length, settings.paragraph_max_length
+        )
+        self._disable_reply_to = settings.disable_reply_to
 
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
@@ -1697,6 +1728,116 @@ class FeishuAdapter(BasePlatformAdapter):
     # Outbound — send / edit / send_image / send_voice / …
     # =========================================================================
 
+    def _effective_reply_to(self, reply_to: Optional[str]) -> Optional[str]:
+        if self._disable_reply_to:
+            return None
+        return reply_to
+
+    def _split_into_paragraphs(self, content: str) -> List[str]:
+        """Split content into natural paragraphs for human-like delivery pacing.
+
+        Splits on double-newlines (blank lines) while protecting:
+        - Fenced code blocks (``` ... ```) — never split inside
+        - List continuations — consecutive lines starting with -/* or digits
+        - Blockquote continuations — consecutive lines starting with >
+
+        Short paragraphs (< 10 chars) are merged with the previous one.
+        Paragraphs exceeding ``_paragraph_max_length`` are force-split at
+        the nearest blank-line boundary before the limit.
+        """
+        if not content:
+            return []
+        lines = content.split("\n")
+        groups: List[List[str]] = []
+        in_code = False
+        current: List[str] = []
+
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                in_code = not in_code
+                current.append(line)
+                continue
+
+            if in_code:
+                current.append(line)
+                continue
+
+            is_list_item = bool(re.match(r"^(\s*[-*]\s|\s*\d+\.\s)", line))
+            is_blockquote = stripped.startswith(">")
+            is_blank = stripped == ""
+
+            if is_blank and current:
+                groups.append(current)
+                current = []
+            elif is_list_item and current and not any(
+                re.match(r"^(\s*[-*]\s|\s*\d+\.\s)", l) for l in current[-1:]
+            ):
+                if current:
+                    groups.append(current)
+                current = [line]
+            elif is_blockquote and current and not current[-1].strip().startswith(">"):
+                if current:
+                    groups.append(current)
+                current = [line]
+            else:
+                current.append(line)
+
+        if current:
+            groups.append(current)
+
+        paragraphs = ["\n".join(g) for g in groups if g]
+        paragraphs = [p for p in paragraphs if p.strip()]
+
+        if not paragraphs:
+            return [content]
+
+        max_len = self._paragraph_max_length
+
+        merged: List[str] = []
+        for para in paragraphs:
+            if not merged:
+                merged.append(para)
+            elif len(para.strip()) < 10 and len(merged[-1]) + 2 + len(para) <= max_len:
+                merged[-1] = merged[-1] + "\n\n" + para
+            else:
+                merged.append(para)
+
+        force_split: List[str] = []
+        for para in merged:
+            if len(para) <= max_len:
+                force_split.append(para)
+                continue
+            sub_lines = para.split("\n")
+            chunk: List[str] = []
+            chunk_len = 0
+            for sl in sub_lines:
+                line_len = len(sl)
+                if line_len > max_len:
+                    if chunk:
+                        force_split.append("\n".join(chunk))
+                        chunk = []
+                        chunk_len = 0
+                    offset = 0
+                    while offset < line_len:
+                        end = min(offset + max_len, line_len)
+                        force_split.append(sl[offset:end])
+                        offset = end
+                elif chunk and chunk_len + 1 + line_len > max_len:
+                    force_split.append("\n".join(chunk))
+                    chunk = [sl]
+                    chunk_len = line_len
+                else:
+                    if chunk:
+                        chunk_len += 1 + line_len
+                    else:
+                        chunk_len = line_len
+                    chunk.append(sl)
+            if chunk:
+                force_split.append("\n".join(chunk))
+
+        return force_split if force_split else [content]
+
     async def send(
         self,
         chat_id: str,
@@ -1704,23 +1845,43 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a Feishu message."""
+        """Send a Feishu message with paragraph-aware pacing.
+
+        When paragraph splitting is enabled, the response is split into
+        natural paragraphs (respecting code blocks, lists, blockquotes)
+        and each paragraph is sent as a separate message with a fixed
+        delay between them to mimic human typing rhythm.  Set
+        ``paragraph_delay_ms`` to 0 to disable the delay.
+        """
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
         formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+
+        if self._paragraph_split and len(formatted) >= self._paragraph_min_length:
+            paragraphs = self._split_into_paragraphs(formatted)
+        else:
+            paragraphs = [formatted]
+
+        all_chunks: List[str] = []
+        for para in paragraphs:
+            chunks = self.truncate_message(para, self.MAX_MESSAGE_LENGTH)
+            all_chunks.extend(chunks)
+
+        effective_reply_to = self._effective_reply_to(reply_to)
         last_response = None
+        last_sent_message_id: Optional[str] = None
 
         try:
-            for chunk in chunks:
+            for idx, chunk in enumerate(all_chunks):
+                chunk_reply_to = effective_reply_to if idx == 0 else None
                 msg_type, payload = self._build_outbound_payload(chunk)
                 try:
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
                         msg_type=msg_type,
                         payload=payload,
-                        reply_to=reply_to,
+                        reply_to=chunk_reply_to,
                         metadata=metadata,
                     )
                 except Exception as exc:
@@ -1731,7 +1892,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         chat_id=chat_id,
                         msg_type="text",
                         payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
-                        reply_to=reply_to,
+                        reply_to=chunk_reply_to,
                         metadata=metadata,
                     )
                 if (
@@ -1744,10 +1905,17 @@ class FeishuAdapter(BasePlatformAdapter):
                         chat_id=chat_id,
                         msg_type="text",
                         payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
-                        reply_to=reply_to,
+                        reply_to=chunk_reply_to,
                         metadata=metadata,
                     )
                 last_response = response
+
+                if self._response_succeeded(response):
+                    last_sent_message_id = self._extract_response_field(response, "message_id")
+
+                is_last = idx == len(all_chunks) - 1
+                if not is_last and self._paragraph_split and self._paragraph_delay_ms > 0:
+                    await asyncio.sleep(self._paragraph_delay_ms / 1000.0)
 
             return self._finalize_send_result(last_response, "send failed")
         except Exception as exc:
@@ -1981,7 +2149,7 @@ class FeishuAdapter(BasePlatformAdapter):
         return await self._send_uploaded_file_message(
             chat_id=chat_id,
             file_path=audio_path,
-            reply_to=reply_to,
+            reply_to=self._effective_reply_to(reply_to),
             metadata=metadata,
             caption=caption,
             outbound_message_type="audio",
@@ -2001,7 +2169,7 @@ class FeishuAdapter(BasePlatformAdapter):
         return await self._send_uploaded_file_message(
             chat_id=chat_id,
             file_path=file_path,
-            reply_to=reply_to,
+            reply_to=self._effective_reply_to(reply_to),
             metadata=metadata,
             caption=caption,
             file_name=file_name,
@@ -2020,7 +2188,7 @@ class FeishuAdapter(BasePlatformAdapter):
         return await self._send_uploaded_file_message(
             chat_id=chat_id,
             file_path=video_path,
-            reply_to=reply_to,
+            reply_to=self._effective_reply_to(reply_to),
             metadata=metadata,
             caption=caption,
             outbound_message_type="media",
@@ -2071,7 +2239,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     chat_id=chat_id,
                     msg_type="post",
                     payload=post_payload,
-                    reply_to=reply_to,
+                    reply_to=self._effective_reply_to(reply_to),
                     metadata=metadata,
                 )
             else:
@@ -2079,7 +2247,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     chat_id=chat_id,
                     msg_type="image",
                     payload=json.dumps({"image_key": image_key}, ensure_ascii=False),
-                    reply_to=reply_to,
+                    reply_to=self._effective_reply_to(reply_to),
                     metadata=metadata,
                 )
             return self._finalize_send_result(message_response, "image send failed")
@@ -2108,14 +2276,14 @@ class FeishuAdapter(BasePlatformAdapter):
                 chat_id=chat_id,
                 image_url=image_url,
                 caption=caption,
-                reply_to=reply_to,
+                reply_to=self._effective_reply_to(reply_to),
                 metadata=metadata,
             )
         return await self.send_image_file(
             chat_id=chat_id,
             image_path=image_path,
             caption=caption,
-            reply_to=reply_to,
+            reply_to=self._effective_reply_to(reply_to),
             metadata=metadata,
         )
 
@@ -2140,7 +2308,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 chat_id=chat_id,
                 animation_url=animation_url,
                 caption=caption,
-                reply_to=reply_to,
+                reply_to=self._effective_reply_to(reply_to),
                 metadata=metadata,
             )
         degraded_caption = f"[GIF downgraded to file]\n{caption}" if caption else "[GIF downgraded to file]"
@@ -2149,7 +2317,7 @@ class FeishuAdapter(BasePlatformAdapter):
             file_path=file_path,
             file_name=file_name,
             caption=degraded_caption,
-            reply_to=reply_to,
+            reply_to=self._effective_reply_to(reply_to),
             metadata=metadata,
         )
 
@@ -4234,7 +4402,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     chat_id=chat_id,
                     msg_type="post",
                     payload=self._build_media_post_payload(caption=caption, media_tag=media_tag),
-                    reply_to=reply_to,
+                    reply_to=self._effective_reply_to(reply_to),
                     metadata=metadata,
                 )
             else:
@@ -4242,7 +4410,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     chat_id=chat_id,
                     msg_type=resolved_message_type,
                     payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
-                    reply_to=reply_to,
+                    reply_to=self._effective_reply_to(reply_to),
                     metadata=metadata,
                 )
             return self._finalize_send_result(message_response, "file send failed")
@@ -4259,19 +4427,20 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
-        effective_reply_to = reply_to
-        if not effective_reply_to and metadata and metadata.get("thread_id"):
-            effective_reply_to = metadata.get("reply_to_message_id")
-        reply_in_thread = bool((metadata or {}).get("thread_id"))
-        if effective_reply_to:
-            body = self._build_reply_message_body(
-                content=payload,
-                msg_type=msg_type,
-                reply_in_thread=reply_in_thread,
-                uuid_value=str(uuid.uuid4()),
-            )
-            request = self._build_reply_message_request(effective_reply_to, body)
-            return await asyncio.to_thread(self._client.im.v1.message.reply, request)
+        if not self._disable_reply_to:
+            effective_reply_to = reply_to
+            if not effective_reply_to and metadata and metadata.get("thread_id"):
+                effective_reply_to = metadata.get("reply_to_message_id")
+            reply_in_thread = bool((metadata or {}).get("thread_id"))
+            if effective_reply_to:
+                body = self._build_reply_message_body(
+                    content=payload,
+                    msg_type=msg_type,
+                    reply_in_thread=reply_in_thread,
+                    uuid_value=str(uuid.uuid4()),
+                )
+                request = self._build_reply_message_request(effective_reply_to, body)
+                return await asyncio.to_thread(self._client.im.v1.message.reply, request)
 
         body = self._build_create_message_body(
             receive_id=chat_id,
@@ -4424,9 +4593,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     reply_to=active_reply_to,
                     metadata=metadata,
                 )
-                # If replying to a message failed because it was withdrawn or not found,
-                # fall back to posting a new message directly to the chat.
-                if active_reply_to and not self._response_succeeded(response):
+                if active_reply_to and not self._disable_reply_to and not self._response_succeeded(response):
                     code = getattr(response, "code", None)
                     if code in _FEISHU_REPLY_FALLBACK_CODES:
                         if (metadata or {}).get("thread_id"):

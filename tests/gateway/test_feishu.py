@@ -1927,9 +1927,10 @@ class TestAdapterBehavior(unittest.TestCase):
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
+        adapter._disable_reply_to = False
         captured = {}
 
-        class _ReplyAPI:
+        class _MessageAPI:
             def reply(self, request):
                 captured["request"] = request
                 return SimpleNamespace(
@@ -1937,10 +1938,17 @@ class TestAdapterBehavior(unittest.TestCase):
                     data=SimpleNamespace(message_id="om_reply"),
                 )
 
+            def create(self, request):
+                captured["create_request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_created"),
+                )
+
         adapter._client = SimpleNamespace(
             im=SimpleNamespace(
                 v1=SimpleNamespace(
-                    message=_ReplyAPI(),
+                    message=_MessageAPI(),
                 )
             )
         )
@@ -1954,7 +1962,7 @@ class TestAdapterBehavior(unittest.TestCase):
                     chat_id="oc_chat",
                     content="hello",
                     reply_to="om_parent",
-                    metadata={"thread_id": "omt-thread"},
+                    metadata={"thread_id": "omt-thread", "reply_to_message_id": "om_parent"},
                 )
             )
 
@@ -1968,6 +1976,7 @@ class TestAdapterBehavior(unittest.TestCase):
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
+        adapter._disable_reply_to = False
         captured = {}
 
         class _MessageAPI:
@@ -1976,6 +1985,13 @@ class TestAdapterBehavior(unittest.TestCase):
                 return SimpleNamespace(
                     success=lambda: True,
                     data=SimpleNamespace(message_id="om_reply"),
+                )
+
+            def create(self, request):
+                captured["create_request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_created"),
                 )
 
         adapter._client = SimpleNamespace(
@@ -2095,6 +2111,7 @@ class TestAdapterBehavior(unittest.TestCase):
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
+        adapter._disable_reply_to = False
         captured = {}
 
         class _FileAPI:
@@ -2110,6 +2127,13 @@ class TestAdapterBehavior(unittest.TestCase):
                 return SimpleNamespace(
                     success=lambda: True,
                     data=SimpleNamespace(message_id="om_file_reply"),
+                )
+
+            def create(self, request):
+                captured["create_request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_file_created"),
                 )
 
         adapter._client = SimpleNamespace(
@@ -2135,7 +2159,7 @@ class TestAdapterBehavior(unittest.TestCase):
                         chat_id="oc_chat",
                         file_path=file_path,
                         reply_to="om_parent",
-                        metadata={"thread_id": "omt-thread"},
+                        metadata={"thread_id": "omt-thread", "reply_to_message_id": "om_parent"},
                     )
                 )
         finally:

@@ -1045,6 +1045,14 @@ def load_gateway_config() -> GatewayConfig:
             if isinstance(feishu_cfg, dict):
                 if "allow_bots" in feishu_cfg and not os.getenv("FEISHU_ALLOW_BOTS"):
                     os.environ["FEISHU_ALLOW_BOTS"] = str(feishu_cfg["allow_bots"]).lower()
+                for _key in (
+                    "paragraph_split", "paragraph_delay_ms",
+                    "paragraph_min_length", "paragraph_max_length", "disable_reply_to",
+                ):
+                    if _key in feishu_cfg:
+                        _env_key = f"FEISHU_{_key.upper()}"
+                        if not os.getenv(_env_key):
+                            os.environ[_env_key] = str(feishu_cfg[_key]).lower()
 
     except Exception as e:
         logger.warning(
