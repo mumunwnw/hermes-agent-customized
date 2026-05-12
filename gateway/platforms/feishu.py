@@ -396,7 +396,7 @@ class FeishuAdapterSettings:
     require_mention: bool = True
     paragraph_split: bool = True
     paragraph_delay_ms: int = 1200
-    paragraph_min_length: int = 200
+    min_message_length: int = 50
     paragraph_max_length: int = 1500
     disable_reply_to: bool = True
 
@@ -1523,9 +1523,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 0,
                 int(extra.get("paragraph_delay_ms", os.getenv("FEISHU_PARAGRAPH_DELAY_MS", "1200")))
             ),
-            paragraph_min_length=max(
-                50,
-                int(extra.get("paragraph_min_length", os.getenv("FEISHU_PARAGRAPH_MIN_LENGTH", "200")))
+            min_message_length=max(
+                10,
+                int(extra.get("min_message_length", os.getenv("FEISHU_MIN_MESSAGE_LENGTH", "50")))
             ),
             paragraph_max_length=max(
                 200,
@@ -1568,9 +1568,9 @@ class FeishuAdapter(BasePlatformAdapter):
         self._require_mention = settings.require_mention
         self._paragraph_split = settings.paragraph_split
         self._paragraph_delay_ms = settings.paragraph_delay_ms
-        self._paragraph_min_length = settings.paragraph_min_length
+        self._min_message_length = settings.min_message_length
         self._paragraph_max_length = max(
-            settings.paragraph_min_length, settings.paragraph_max_length
+            settings.min_message_length, settings.paragraph_max_length
         )
         self._disable_reply_to = settings.disable_reply_to
 
@@ -1738,12 +1738,18 @@ class FeishuAdapter(BasePlatformAdapter):
 
         Splits on double-newlines (blank lines) while protecting:
         - Fenced code blocks (``` ... ```) — never split inside
-        - List continuations — consecutive lines starting with -/* or digits
         - Blockquote continuations — consecutive lines starting with >
 
-        Short paragraphs (< 10 chars) are merged with the previous one.
-        Paragraphs exceeding ``_paragraph_max_length`` are force-split at
-        the nearest blank-line boundary before the limit.
+        List items are NOT split from preceding content — a heading followed
+        by a list (without a blank line) stays in the same paragraph.  Blank
+        lines remain the only paragraph separator for non-code, non-quote text.
+
+        Post-split merging rules:
+        - List-starting paragraphs merge with the previous paragraph (likely a heading/intro)
+        - Short paragraphs (< min_message_length) merge with the next paragraph
+          (or previous if it's the last one)
+        - Paragraphs exceeding ``_paragraph_max_length`` are force-split at
+        the nearest line boundary before the limit.
         """
         if not content:
             return []
@@ -1763,19 +1769,12 @@ class FeishuAdapter(BasePlatformAdapter):
                 current.append(line)
                 continue
 
-            is_list_item = bool(re.match(r"^(\s*[-*]\s|\s*\d+\.\s)", line))
             is_blockquote = stripped.startswith(">")
             is_blank = stripped == ""
 
             if is_blank and current:
                 groups.append(current)
                 current = []
-            elif is_list_item and current and not any(
-                re.match(r"^(\s*[-*]\s|\s*\d+\.\s)", l) for l in current[-1:]
-            ):
-                if current:
-                    groups.append(current)
-                current = [line]
             elif is_blockquote and current and not current[-1].strip().startswith(">"):
                 if current:
                     groups.append(current)
@@ -1793,18 +1792,61 @@ class FeishuAdapter(BasePlatformAdapter):
             return [content]
 
         max_len = self._paragraph_max_length
+        min_len = self._min_message_length
 
-        merged: List[str] = []
+        def _is_list_paragraph(p: str) -> bool:
+            first_line = p.lstrip().split("\n", 1)[0].strip()
+            return bool(re.match(r"^([-*]\s|\d+\.\s)", first_line))
+
+        def _contains_list(p: str) -> bool:
+            return any(
+                re.match(r"^\s*([-*]\s|\d+\.\s)", line)
+                for line in p.split("\n")
+            )
+
+        list_merged: List[str] = []
         for para in paragraphs:
-            if not merged:
-                merged.append(para)
-            elif len(para.strip()) < 10 and len(merged[-1]) + 2 + len(para) <= max_len:
-                merged[-1] = merged[-1] + "\n\n" + para
-            else:
-                merged.append(para)
+            if list_merged and _is_list_paragraph(para):
+                if len(list_merged[-1]) + 2 + len(para) <= max_len:
+                    list_merged[-1] = list_merged[-1] + "\n\n" + para
+                    continue
+            list_merged.append(para)
+
+        short_merged: List[str] = list(list_merged)
+        changed = True
+        while changed:
+            changed = False
+            next_pass: List[str] = []
+            i = 0
+            while i < len(short_merged):
+                para = short_merged[i]
+                is_short = len(para.strip()) < min_len and not _contains_list(para)
+                if next_pass and is_short:
+                    if len(next_pass[-1]) + 2 + len(para) <= max_len:
+                        next_pass[-1] = next_pass[-1] + "\n\n" + para
+                        i += 1
+                        changed = True
+                        continue
+                if is_short and i < len(short_merged) - 1:
+                    next_para = short_merged[i + 1]
+                    if len(para) + 2 + len(next_para) <= max_len:
+                        next_pass.append(para + "\n\n" + next_para)
+                        i += 2
+                        changed = True
+                        continue
+                next_pass.append(para)
+                i += 1
+            if next_pass and len(next_pass[-1].strip()) < min_len and len(next_pass) > 1 and not _contains_list(next_pass[-1]):
+                last = next_pass.pop()
+                if len(next_pass[-1]) + 2 + len(last) <= max_len:
+                    next_pass[-1] = next_pass[-1] + "\n\n" + last
+                    changed = True
+                else:
+                    next_pass.append(last)
+            short_merged = next_pass
 
         force_split: List[str] = []
-        for para in merged:
+        for para in short_merged:
             if len(para) <= max_len:
                 force_split.append(para)
                 continue
@@ -1858,7 +1900,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         formatted = self.format_message(content)
 
-        if self._paragraph_split and len(formatted) >= self._paragraph_min_length:
+        if self._paragraph_split:
             paragraphs = self._split_into_paragraphs(formatted)
         else:
             paragraphs = [formatted]

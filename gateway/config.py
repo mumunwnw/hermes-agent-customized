@@ -1047,7 +1047,7 @@ def load_gateway_config() -> GatewayConfig:
                     os.environ["FEISHU_ALLOW_BOTS"] = str(feishu_cfg["allow_bots"]).lower()
                 for _key in (
                     "paragraph_split", "paragraph_delay_ms",
-                    "paragraph_min_length", "paragraph_max_length", "disable_reply_to",
+                    "min_message_length", "paragraph_max_length", "disable_reply_to",
                 ):
                     if _key in feishu_cfg:
                         _env_key = f"FEISHU_{_key.upper()}"
