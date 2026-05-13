@@ -45,6 +45,7 @@ BOLD='\033[1m'
 # Configuration
 REPO_URL_SSH="git@github.com:NousResearch/hermes-agent.git"
 REPO_URL_HTTPS="https://github.com/NousResearch/hermes-agent.git"
+REPO_URL="${HERMES_REPO_URL:-}"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 # INSTALL_DIR is resolved AFTER arg parsing and OS detection so we can pick an
 # FHS-style layout for root installs.  Track whether the user gave us an
@@ -94,6 +95,10 @@ while [[ $# -gt 0 ]]; do
             BRANCH="$2"
             shift 2
             ;;
+        --repo)
+            REPO_URL="$2"
+            shift 2
+            ;;
         --dir)
             INSTALL_DIR="$2"
             INSTALL_DIR_EXPLICIT=true
@@ -112,6 +117,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --no-venv      Don't create virtual environment"
             echo "  --skip-setup   Skip interactive setup wizard"
             echo "  --branch NAME  Git branch to install (default: main)"
+            echo "  --repo URL     Git repository to install (default: NousResearch/hermes-agent)"
+            echo "                   can also be set with \$HERMES_REPO_URL"
             echo "  --dir PATH     Installation directory"
             echo "                   default (non-root):  ~/.hermes/hermes-agent"
             echo "                   default (root, Linux): /usr/local/lib/hermes-agent"
@@ -893,9 +900,19 @@ clone_repo() {
                 autostash_ref="stash@{0}"
             fi
 
+            if [ -n "$REPO_URL" ]; then
+                current_origin="$(git remote get-url origin 2>/dev/null || true)"
+                if [ "$current_origin" != "$REPO_URL" ]; then
+                    log_info "Setting origin remote to $REPO_URL"
+                    git remote set-url origin "$REPO_URL"
+                fi
+            fi
+
             git fetch origin
             git checkout "$BRANCH"
             git pull --ff-only origin "$BRANCH"
+            git config hermes.updateRemote origin
+            git config hermes.updateBranch "$BRANCH"
 
             if [ -n "$autostash_ref" ]; then
                 local restore_now="yes"
@@ -934,23 +951,37 @@ clone_repo() {
             exit 1
         fi
     else
-        # Try SSH first (for private repo access), fall back to HTTPS
-        # GIT_SSH_COMMAND disables interactive prompts and sets a short timeout
-        # so SSH fails fast instead of hanging when no key is configured.
-        log_info "Trying SSH clone..."
-        if GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=5" \
-           git clone --branch "$BRANCH" "$REPO_URL_SSH" "$INSTALL_DIR" 2>/dev/null; then
-            log_success "Cloned via SSH"
-        else
-            rm -rf "$INSTALL_DIR" 2>/dev/null  # Clean up partial SSH clone
-            log_info "SSH failed, trying HTTPS..."
-            if git clone --branch "$BRANCH" "$REPO_URL_HTTPS" "$INSTALL_DIR"; then
-                log_success "Cloned via HTTPS"
+        if [ -n "$REPO_URL" ]; then
+            log_info "Cloning from $REPO_URL..."
+            if git clone --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR"; then
+                log_success "Cloned repository"
             else
                 log_error "Failed to clone repository"
                 exit 1
             fi
+        else
+            # Try SSH first (for private repo access), fall back to HTTPS
+            # GIT_SSH_COMMAND disables interactive prompts and sets a short timeout
+            # so SSH fails fast instead of hanging when no key is configured.
+            log_info "Trying SSH clone..."
+            if GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=5" \
+               git clone --branch "$BRANCH" "$REPO_URL_SSH" "$INSTALL_DIR" 2>/dev/null; then
+                log_success "Cloned via SSH"
+            else
+                rm -rf "$INSTALL_DIR" 2>/dev/null  # Clean up partial SSH clone
+                log_info "SSH failed, trying HTTPS..."
+                if git clone --branch "$BRANCH" "$REPO_URL_HTTPS" "$INSTALL_DIR"; then
+                    log_success "Cloned via HTTPS"
+                else
+                    log_error "Failed to clone repository"
+                    exit 1
+                fi
+            fi
         fi
+
+        cd "$INSTALL_DIR"
+        git config hermes.updateRemote origin
+        git config hermes.updateBranch "$BRANCH"
     fi
 
     cd "$INSTALL_DIR"

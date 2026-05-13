@@ -305,6 +305,7 @@ def _setup_update_mocks(monkeypatch, tmp_path):
     monkeypatch.setattr(hermes_config, "get_missing_config_fields", lambda: [])
     monkeypatch.setattr(hermes_config, "check_config_version", lambda: (5, 5))
     monkeypatch.setattr(hermes_config, "migrate_config", lambda **kw: {"env_added": [], "config_added": []})
+    monkeypatch.setattr(hermes_config, "read_raw_config", lambda: {})
 
 
 def test_cmd_update_retries_optional_extras_individually_when_all_fails(monkeypatch, tmp_path, capsys):
@@ -432,6 +433,22 @@ def test_install_heartbeat_prints_when_dependency_install_is_silent(monkeypatch,
 
     out = capsys.readouterr().out
     assert "still installing dependencies" in out
+
+
+def test_get_update_source_reads_installer_git_config(monkeypatch, tmp_path):
+    """Installer-written local git config selects the runtime update branch."""
+    monkeypatch.setattr(hermes_config, "read_raw_config", lambda: {})
+
+    def fake_run(cmd, **kwargs):
+        if cmd == ["git", "config", "--get", "hermes.updateRemote"]:
+            return SimpleNamespace(stdout="origin\n", stderr="", returncode=0)
+        if cmd == ["git", "config", "--get", "hermes.updateBranch"]:
+            return SimpleNamespace(stdout="custom\n", stderr="", returncode=0)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    assert hermes_main._get_update_source(["git"], tmp_path) == ("origin", "custom")
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +613,31 @@ def test_cmd_update_no_checkout_when_already_on_main(monkeypatch, tmp_path):
 
     checkout_calls = [c for c in recorded if "checkout" in c]
     assert len(checkout_calls) == 0
+
+
+def test_cmd_update_uses_configured_remote_branch(monkeypatch, tmp_path, capsys):
+    """Configured runtime installs pull from the configured remote branch."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    monkeypatch.setattr(
+        hermes_config,
+        "read_raw_config",
+        lambda: {"updates": {"remote": "origin", "branch": "custom"}},
+    )
+
+    side_effect, recorded = _make_update_side_effect(current_branch="main")
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    assert ["git", "fetch", "origin"] in recorded
+    assert ["git", "checkout", "custom"] in recorded
+    assert ["git", "rev-list", "HEAD..origin/custom", "--count"] in recorded
+    assert ["git", "pull", "--ff-only", "origin", "custom"] in recorded
+    assert ["git", "pull", "--ff-only", "origin", "main"] not in recorded
+
+    out = capsys.readouterr().out
+    assert "Update source: origin/custom" in out
 
 
 # ---------------------------------------------------------------------------
