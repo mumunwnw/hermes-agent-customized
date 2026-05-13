@@ -1,0 +1,49 @@
+version: 1
+updated: "2026-05-13"
+policy:
+  pure_upstream_branch: main
+  integration_branch: stable
+  forbidden_on_main:
+    - fork-only features
+    - personalized behavior
+    - local workflow changes
+    - generated customization docs
+upstream:
+  remote: upstream
+  branch: main
+  commit: 942adf617910f50a39f41bd200d8083bf4cb2bed
+custom_branches:
+  - name: feature/feishu-messages-enhanced
+    head: 5323c57835298132e0f7c09eca198ac4a4fcc056
+    included_in_stable: true
+    purpose: Feishu paragraph-aware delivery, pacing, list and short-paragraph merging.
+    preferred_boundary:
+      - gateway/platforms/feishu.py
+      - gateway/platforms/base.py
+    drop_condition: Upstream ships equivalent Feishu message batching, pacing, and merge controls.
+  - name: feature/hybrid-session-search
+    head: 4eb94a35c9c77afac8bb943f2bcd69a02929a21a
+    included_in_stable: true
+    purpose: Hybrid session search with BM25, vector search, RRF, indexing tools, diagnostics, and logging.
+    preferred_boundary:
+      - plugins/hybrid-search-indexer/
+      - tools/hybrid_search.py
+      - tools/session_search_tool.py
+    drop_condition: Upstream ships comparable hybrid search and indexing diagnostics.
+  - name: feature/stable-branch-update
+    head: 0e1c36554d09be9c0b4d546cd5bb3407a9cfc7fd
+    included_in_stable: true
+    purpose: Fork update flow that targets the stable branch instead of main.
+    preferred_boundary:
+      - fork-only script or docs
+      - hermes_cli/main.py only if unavoidable
+    drop_condition: Upstream supports configurable update targets without core patching.
+checks:
+  main_is_pure:
+    - git rev-parse main origin/main upstream/main
+    - git diff --stat upstream/main..main
+    - git rev-list --left-right --count upstream/main...main
+  customization_drift:
+    - git cherry -v upstream/main stable
+    - git diff --stat upstream/main...stable
+    - git rev-list --left-right --count upstream/main...stable
