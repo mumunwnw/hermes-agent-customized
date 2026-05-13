@@ -1,161 +1,155 @@
-# Fork Customization Registry
+# Custom Branch Registry
 
-This fork uses `main` as a clean mirror of `upstream/main`.
+This fork now uses a two-track layout:
 
-Do not commit local or personalized changes to `main`. All fork-only behavior
-must live on dedicated customization branches and be recorded in this directory.
+- `main`: exact mirror of `upstream/main`
+- `custom`: fork-only runtime branch
+
+Do not commit local or personalized changes to `main`. All fork behavior should
+land on `custom` or on short-lived topic branches that are later merged into
+`custom`.
 
 ## Branch Policy
 
-- `main`: exact upstream mirror. It may only be advanced by fast-forwarding to
-  `upstream/main`, then pushing that same commit to `origin/main`.
-- `stable`: integration branch for local customizations that should be usable
-  day to day.
-- `feature/*`: topic branches for one customization area. Keep each topic as
-  small as possible.
-- `codex/*`: maintenance, documentation, or automation branches created by
-  Codex. These must not be merged into `main`.
+- `main`: pure upstream mirror. Only fast-forward it to `upstream/main`, then
+  push the same commit to `origin/main`.
+- `custom`: the only long-lived fork runtime branch. This is the branch that
+  the installed Hermes runtime should track.
+- `feature/*`: topic branches for individual custom features that we are still
+  studying or rewriting.
+- `codex/*`: temporary maintenance or rewrite branches. Merge what we want into
+  `custom`, then delete them.
 
-Before touching code, start from the right base:
+## Runtime Layout
 
-```bash
-git switch main
-git fetch upstream
-git merge --ff-only upstream/main
-git push origin main
+Development and runtime are intentionally separate:
 
-git switch -c feature/<area> main
-```
+- Development checkout:
+  `/Users/mumu/github-repo/hermes-agent-customized`
+- Runtime data/config:
+  `~/.hermes`
+- Runtime code checkout:
+  `~/.hermes/hermes-agent`
 
-When integrating a local feature:
+The runtime checkout must pull from the fork's remote `custom` branch. It must
+not share the development checkout, and it must not use `main` as its update
+branch.
 
-```bash
-git switch stable
-git rebase origin/main
-git merge --no-ff feature/<area>
-git push origin stable
-```
+Current runtime expectations:
 
-If the feature is a long-lived patch over upstream, prefer rebasing the feature
-branch onto current `main` and keeping commits logically grouped:
+- remote: `origin`
+- branch: `custom`
+- local git config in the runtime checkout:
+  - `hermes.updateRemote=origin`
+  - `hermes.updateBranch=custom`
 
-```bash
-git switch feature/<area>
-git rebase main
-```
+## Current State
 
-## Current Customization Inventory
-
-Snapshot date: 2026-05-13.
+Snapshot date: 2026-05-14.
 
 Upstream mirror commit:
 
 - `main`, `origin/main`, `upstream/main`:
   `942adf617910f50a39f41bd200d8083bf4cb2bed`
 
-Customization integration branch:
+Fork runtime branch:
 
-- `stable` / `origin/stable`:
-  `5323c57835298132e0f7c09eca198ac4a4fcc056`
-- Relationship to `upstream/main`: `348` upstream commits ahead of the old
-  fork point, `63` local commits on `stable`.
-- Merge base with current upstream:
-  `369cee018d46560e7076e209f311756aa5ec1f70`
+- `custom` / `origin/custom`:
+  `8c928d8e25c2c9871f427b1c67999e6c4acadc36`
+- Relationship to `upstream/main`:
+  `0` upstream-only commits on `custom`, `7` fork-only commits on `custom`
 
-Tracked local feature branches:
+Custom work already merged into `custom`:
+
+| Area | Source | Status | Purpose |
+| --- | --- | --- | --- |
+| Runtime update source | `codex/rewrite-update-custom-branch` | merged | `hermes update` reads its remote/branch from config or local git config and can track `origin/custom` instead of forcing `origin/main`. |
+| Installer repo selection | `codex/rewrite-update-custom-branch` | merged | `scripts/install.sh` supports `--repo` / `HERMES_REPO_URL` and records runtime update metadata in `.git/config`. |
+| Launcher safety | `codex/rewrite-update-custom-branch` | merged | Installer removes an old `~/.local/bin/hermes` symlink before writing the launcher so it cannot overwrite the real venv entrypoint. |
+| Custom branch registry | `codex/customization-registry` | merged | This `.custom/` directory and `scripts/customization_report.sh` are now maintained directly on `custom`. |
+
+Custom work still living only on topic branches:
 
 | Branch | Head | Status | Purpose |
 | --- | --- | --- | --- |
-| `feature/feishu-messages-enhanced` | `5323c5783` | included in `stable` | Feishu paragraph-aware delivery, pacing, list and short-paragraph merging. |
-| `feature/hybrid-session-search` | `4eb94a35c` | included in `stable` | Hybrid session search with BM25, vector search, RRF, indexing tools, diagnostics, and logging. |
-| `feature/stable-branch-update` | `0e1c36554` | included in `stable` | Changes `hermes update` behavior for the fork's stable branch flow. |
+| `feature/feishu-messages-enhanced` | `5323c5783` | not yet rewritten onto `custom` | Feishu paragraph-aware delivery, pacing, list and short-paragraph merging. |
+| `feature/hybrid-session-search` | `4eb94a35c` | not yet rewritten onto `custom` | Hybrid session search with BM25, vector search, RRF, indexing tools, diagnostics, and logging. |
+| `stable` | `5323c5783` | legacy branch, no longer authoritative | Old integration branch kept only as historical reference until remaining features are rewritten. |
 
-Current local diff surface on `stable` versus current upstream:
-
-- `.plans/hybrid-session-search.md`
-- `gateway/config.py`
-- `gateway/platforms/base.py`
-- `gateway/platforms/feishu.py`
-- `hermes_cli/config.py`
-- `hermes_cli/logs.py`
-- `hermes_cli/main.py`
-- `hermes_logging.py`
-- `model_tools.py`
-- `plugins/hybrid-search-indexer/__init__.py`
-- `plugins/hybrid-search-indexer/plugin.yaml`
-- `run_agent.py`
-- `scripts/index_embeddings.py`
-- `tests/gateway/test_feishu.py`
-- `tests/tools/test_hybrid_search.py`
-- `tools/hybrid_search.py`
-- `tools/session_search_tool.py`
-- `toolsets.py`
-- `website/docs/getting-started/updating.md`
-
-Notes:
-
-- `git cherry -v upstream/main stable` currently marks all customization
-  commits with `+`, meaning upstream does not contain patch-equivalent versions
-  of these commits yet.
-- `stable` currently contains duplicated generations of the hybrid-search work.
-  Before long-term maintenance, consider squashing or rebuilding the patch stack
-  into smaller topic branches.
-
-## Upstream Coverage Check
-
-Run this after every upstream sync:
-
-```bash
-git fetch upstream origin
-git switch main
-git merge --ff-only upstream/main
-git push origin main
-
-git cherry -v upstream/main stable
-git diff --stat upstream/main...stable
-git rev-list --left-right --count upstream/main...stable
-```
-
-Interpretation:
-
-- `git cherry` lines starting with `-` are patch-equivalent to upstream and can
-  usually be dropped from the local patch stack after review.
-- `git cherry` lines starting with `+` remain fork-only.
-- A growing `git diff --stat` means local customizations are spreading across
-  the upstream tree and should be reconsidered or moved behind plugin/config
-  boundaries where possible.
-
-For a topic branch:
-
-```bash
-git range-diff upstream/main...feature/<area>
-git diff --stat upstream/main...feature/<area>
-```
-
-## Maintenance Rules
+## Operating Rules
 
 1. Keep `main` pure.
-2. Prefer plugins, optional skills, config keys, and isolated adapters over
-   editing central files such as `run_agent.py`, `cli.py`, `gateway/run.py`, or
-   `model_tools.py`.
-3. If a central file must change, keep the change behind a small function,
-   config gate, or extension hook.
-4. Every customization area should have:
-   - one topic branch;
-   - a short entry in this registry;
-   - focused tests for the behavior;
-   - a clear "drop condition" describing when upstream replaces it.
-5. When upstream adds an equivalent feature, first remove the local feature
-   branch from `stable`, then verify behavior with tests, then update this file.
+2. Merge only reviewed, intentional fork behavior into `custom`.
+3. Keep the runtime checkout on `custom`; upstream sync belongs in the
+   development checkout, not in the runtime install.
+4. Prefer plugins, optional skills, config keys, and isolated adapters over
+   broad edits to central files.
+5. If a central file must change, hide the fork behavior behind a narrow
+   helper, config gate, or runtime metadata.
+6. Every remaining customization should end up with:
+   - one topic branch,
+   - one short entry in this registry,
+   - focused tests,
+   - one clear drop condition describing when upstream replaces it.
 
-## Suggested Refactor Targets
+## Update Flow
 
-- Hybrid session search should ideally live as a plugin or behind a narrow
-  search-provider interface, leaving `tools/session_search_tool.py`,
-  `toolsets.py`, and `run_agent.py` with minimal integration code.
-- Feishu message pacing should stay localized to `gateway/platforms/feishu.py`
-  and shared gateway message abstractions only when multiple platforms need the
-  same behavior.
-- Fork update behavior should avoid changing user-facing upstream docs or core
-  CLI flow if it can be represented as a fork-only helper script or branch
-  maintenance note.
+Development mirror refresh:
+
+```bash
+git switch main
+git fetch upstream
+git merge --ff-only upstream/main
+git push origin main
+```
+
+Custom feature work:
+
+```bash
+git switch -c feature/<area> main
+# implement or rewrite
+git switch custom
+git merge --no-ff feature/<area>
+git push origin custom
+```
+
+Runtime install refresh:
+
+```bash
+cd ~/.hermes/hermes-agent
+hermes update
+```
+
+That runtime update must fetch from the remote configured for the runtime
+checkout, currently `origin/custom`.
+
+## Verification
+
+Run this after upstream syncs or custom merges:
+
+```bash
+git rev-parse main origin/main upstream/main
+git diff --stat upstream/main..main
+git rev-list --left-right --count upstream/main...main
+
+git rev-list --left-right --count upstream/main...custom
+git diff --stat upstream/main...custom
+git cherry -v upstream/main custom
+```
+
+For the runtime install:
+
+```bash
+git -C ~/.hermes/hermes-agent branch --show-current
+git -C ~/.hermes/hermes-agent config --get hermes.updateRemote
+git -C ~/.hermes/hermes-agent config --get hermes.updateBranch
+```
+
+## Next Refactor Targets
+
+- Rewrite `feature/feishu-messages-enhanced` onto a fresh topic branch from
+  `main`, then merge the clean version into `custom`.
+- Rewrite `feature/hybrid-session-search` onto a fresh topic branch from
+  `main`, ideally pushing more of it behind plugin or provider boundaries.
+- Delete `stable` after the remaining historical feature content is either
+  rewritten or consciously discarded.

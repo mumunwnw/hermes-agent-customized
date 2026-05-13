@@ -1,8 +1,10 @@
 version: 1
-updated: "2026-05-13"
+updated: "2026-05-14"
 policy:
   pure_upstream_branch: main
-  integration_branch: stable
+  runtime_branch: custom
+  runtime_install_dir: ~/.hermes/hermes-agent
+  runtime_state_dir: ~/.hermes
   forbidden_on_main:
     - fork-only features
     - personalized behavior
@@ -13,9 +15,19 @@ upstream:
   branch: main
   commit: 942adf617910f50a39f41bd200d8083bf4cb2bed
 custom_branches:
+  - name: custom
+    head: 8c928d8e25c2c9871f427b1c67999e6c4acadc36
+    merged: true
+    purpose: Runtime branch for the fork. Installed Hermes instances should update from origin/custom.
+    preferred_boundary:
+      - hermes_cli/main.py
+      - scripts/install.sh
+      - .custom/
+    drop_condition: Never drop as a concept; only replace if the fork abandons a dedicated runtime branch model.
   - name: feature/feishu-messages-enhanced
     head: 5323c57835298132e0f7c09eca198ac4a4fcc056
-    included_in_stable: true
+    merged: false
+    legacy_source: stable
     purpose: Feishu paragraph-aware delivery, pacing, list and short-paragraph merging.
     preferred_boundary:
       - gateway/platforms/feishu.py
@@ -23,27 +35,33 @@ custom_branches:
     drop_condition: Upstream ships equivalent Feishu message batching, pacing, and merge controls.
   - name: feature/hybrid-session-search
     head: 4eb94a35c9c77afac8bb943f2bcd69a02929a21a
-    included_in_stable: true
+    merged: false
+    legacy_source: stable
     purpose: Hybrid session search with BM25, vector search, RRF, indexing tools, diagnostics, and logging.
     preferred_boundary:
       - plugins/hybrid-search-indexer/
       - tools/hybrid_search.py
       - tools/session_search_tool.py
     drop_condition: Upstream ships comparable hybrid search and indexing diagnostics.
-  - name: feature/stable-branch-update
-    head: 0e1c36554d09be9c0b4d546cd5bb3407a9cfc7fd
-    included_in_stable: true
-    purpose: Fork update flow that targets the stable branch instead of main.
+  - name: codex/rewrite-update-custom-branch
+    head: fc2bc7c6b83161fbbc977379ea5711c607f2c678
+    merged: true
+    merged_into: custom
+    purpose: Adds remote/branch-aware runtime updates and installer support for fork runtime repos.
     preferred_boundary:
-      - fork-only script or docs
-      - hermes_cli/main.py only if unavoidable
-    drop_condition: Upstream supports configurable update targets without core patching.
+      - hermes_cli/main.py
+      - scripts/install.sh
+    drop_condition: Upstream supports configurable runtime update sources and safe launcher rewrites.
 checks:
   main_is_pure:
     - git rev-parse main origin/main upstream/main
     - git diff --stat upstream/main..main
     - git rev-list --left-right --count upstream/main...main
   customization_drift:
-    - git cherry -v upstream/main stable
-    - git diff --stat upstream/main...stable
-    - git rev-list --left-right --count upstream/main...stable
+    - git cherry -v upstream/main custom
+    - git diff --stat upstream/main...custom
+    - git rev-list --left-right --count upstream/main...custom
+  runtime_install:
+    - git -C ~/.hermes/hermes-agent branch --show-current
+    - git -C ~/.hermes/hermes-agent config --get hermes.updateRemote
+    - git -C ~/.hermes/hermes-agent config --get hermes.updateBranch
