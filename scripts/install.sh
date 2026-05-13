@@ -1311,6 +1311,12 @@ setup_path() {
     # We intentionally clear PYTHONPATH/PYTHONHOME here so inherited env vars
     # can't make this launcher import modules from another checkout.
     mkdir -p "$command_link_dir"
+    # If a previous install left a symlink here, shell redirection would follow
+    # it and overwrite the venv entrypoint itself. Remove the link first so we
+    # always create a standalone launcher file.
+    if [ -L "$command_link_dir/hermes" ]; then
+        rm -f "$command_link_dir/hermes"
+    fi
     cat > "$command_link_dir/hermes" <<EOF
 #!/usr/bin/env bash
 unset PYTHONPATH
