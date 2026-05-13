@@ -2,6 +2,18 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
+## Fork-Specific Workflow
+
+For this fork, always read `.custom/CUSTOMIZATIONS.md` before doing any of the
+following:
+
+- branch maintenance or cleanup
+- `hermes update` / installer / runtime-update flow changes
+- custom feature rewrites or merges into `custom`
+
+Treat `.custom/` as the canonical registry for this fork's branch model,
+runtime install model, and remaining custom feature inventory.
+
 ## Development Environment
 
 ```bash
